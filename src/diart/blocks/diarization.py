@@ -39,6 +39,7 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         beta: float = 10,
         max_speakers: int = 20,
         normalize_embedding_weights: bool = False,
+        log_level: int = logging.INFO,
         compile: bool = False,
         log_system_stats: bool = False,
         device: torch.device | None = None,
@@ -78,6 +79,7 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        logger.setLevel(log_level)
 
     @property
     def duration(self) -> float:
