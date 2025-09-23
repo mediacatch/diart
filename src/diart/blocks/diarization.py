@@ -41,7 +41,6 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         normalize_embedding_weights: bool = False,
         log_level: int = logging.INFO,
         compile: bool = False,
-        log_system_stats: bool = False,
         device: torch.device | None = None,
         sample_rate: int = 16000,
         **kwargs,
@@ -75,7 +74,6 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.max_speakers = max_speakers
         self.normalize_embedding_weights = normalize_embedding_weights
         self.compile = compile
-        self.log_system_stats = log_system_stats
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -132,7 +130,7 @@ class SpeakerDiarization(base.Pipeline):
         self.binarize = Binarize(self._config.tau_active)
 
         # System monitoring setup
-        self.system_monitor = SystemMonitor(logger) if self._config.log_system_stats else None
+        self.system_monitor = SystemMonitor(logger)
 
         # Internal state, handle with care
         self.timestamp_shift = 0
@@ -217,8 +215,7 @@ class SpeakerDiarization(base.Pipeline):
         assert batch.shape[1] == expected_num_samples, msg
 
         # Extract segmentation and embeddings
-        if self.system_monitor:
-            self.system_monitor.log_system_info("PRE-SEGMENTATION", logging.DEBUG)
+        self.system_monitor.log_system_info("PRE-SEGMENTATION", logging.DEBUG)
 
         seg_start = time.time()
         segmentations = self.segmentation(batch)  # shape (batch, frames, speakers)
@@ -227,8 +224,7 @@ class SpeakerDiarization(base.Pipeline):
         logger.debug(f"[SpeakerDiarization] Segmentation took {seg_time:.5f}s, shape: {segmentations.shape}")
 
         # embeddings has shape (batch, speakers, emb_dim)
-        if self.system_monitor:
-            self.system_monitor.log_system_info("PRE-EMBEDDING", logging.DEBUG)
+        self.system_monitor.log_system_info("PRE-EMBEDDING", logging.DEBUG)
 
         emb_start = time.time()
         embeddings = self.embedding(batch, segmentations)
