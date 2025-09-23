@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Sequence
+import logging
+import time
 
 import numpy as np
 import torch
@@ -16,6 +18,10 @@ from .embedding import OverlapAwareSpeakerEmbedding
 from .segmentation import SpeakerSegmentation
 from .utils import Binarize
 from .. import models as m
+from ..utils import SystemMonitor
+
+# Configure logger for diarization pipeline
+logger = logging.getLogger(__name__)
 
 
 class SpeakerDiarizationConfig(base.PipelineConfig):
@@ -33,6 +39,8 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         beta: float = 10,
         max_speakers: int = 20,
         normalize_embedding_weights: bool = False,
+        compile: bool = False,
+        log_system_stats: bool = False,
         device: torch.device | None = None,
         sample_rate: int = 16000,
         **kwargs,
@@ -65,6 +73,8 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.beta = beta
         self.max_speakers = max_speakers
         self.normalize_embedding_weights = normalize_embedding_weights
+        self.compile = compile
+        self.log_system_stats = log_system_stats
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -94,7 +104,7 @@ class SpeakerDiarization(base.Pipeline):
         assert self._config.step <= self._config.latency <= self._config.duration, msg
 
         self.segmentation = SpeakerSegmentation(
-            self._config.segmentation, self._config.device
+            self._config.segmentation, self._config.device, self._config.compile
         )
         self.embedding = OverlapAwareSpeakerEmbedding(
             self._config.embedding,
@@ -103,6 +113,7 @@ class SpeakerDiarization(base.Pipeline):
             norm=1,
             normalize_weights=self._config.normalize_embedding_weights,
             device=self._config.device,
+            use_compile=self._config.compile,
         )
         self.pred_aggregation = DelayedAggregation(
             self._config.step,
@@ -118,10 +129,22 @@ class SpeakerDiarization(base.Pipeline):
         )
         self.binarize = Binarize(self._config.tau_active)
 
+        # System monitoring setup
+        self.system_monitor = SystemMonitor(logger) if self._config.log_system_stats else None
+
         # Internal state, handle with care
         self.timestamp_shift = 0
         self.clustering = None
         self.chunk_buffer, self.pred_buffer = [], []
+
+        # Track statistics
+        self._call_count = 0
+        self._total_processing_time = 0
+        self._segmentation_times = []
+        self._embedding_times = []
+        self._clustering_times = []
+        self._last_output_time = None
+
         self.reset()
 
     @staticmethod
@@ -153,6 +176,12 @@ class SpeakerDiarization(base.Pipeline):
             self.config.max_speakers,
         )
         self.chunk_buffer, self.pred_buffer = [], []
+        self._call_count = 0
+        self._total_processing_time = 0
+        self._segmentation_times = []
+        self._embedding_times = []
+        self._clustering_times = []
+        self._last_output_time = None
 
     def __call__(
         self, waveforms: Sequence[SlidingWindowFeature]
@@ -169,6 +198,9 @@ class SpeakerDiarization(base.Pipeline):
         Sequence[tuple[Annotation, SlidingWindowFeature]]
             Speaker diarization of each chunk alongside their corresponding audio.
         """
+        start_time = time.time()
+        self._call_count += 1
+
         batch_size = len(waveforms)
         msg = "Pipeline expected at least 1 input"
         assert batch_size >= 1, msg
@@ -183,14 +215,29 @@ class SpeakerDiarization(base.Pipeline):
         assert batch.shape[1] == expected_num_samples, msg
 
         # Extract segmentation and embeddings
+        if self.system_monitor:
+            self.system_monitor.log_system_info("PRE-SEGMENTATION", logging.DEBUG)
+
+        seg_start = time.time()
         segmentations = self.segmentation(batch)  # shape (batch, frames, speakers)
+        seg_time = time.time() - seg_start
+        self._segmentation_times.append(seg_time)
+        logger.debug(f"[SpeakerDiarization] Segmentation took {seg_time:.5f}s, shape: {segmentations.shape}")
+
         # embeddings has shape (batch, speakers, emb_dim)
+        if self.system_monitor:
+            self.system_monitor.log_system_info("PRE-EMBEDDING", logging.DEBUG)
+
+        emb_start = time.time()
         embeddings = self.embedding(batch, segmentations)
+        emb_time = time.time() - emb_start
+        self._embedding_times.append(emb_time)
+        logger.debug(f"[SpeakerDiarization] Embedding extraction took {emb_time:.5f}s, shape: {embeddings.shape}")
 
         seg_resolution = waveforms[0].extent.duration / segmentations.shape[1]
 
         outputs = []
-        for wav, seg, emb in zip(waveforms, segmentations, embeddings):
+        for idx, (wav, seg, emb) in enumerate(zip(waveforms, segmentations, embeddings)):
             # Add timestamps to segmentation
             sw = SlidingWindow(
                 start=wav.extent.start,
@@ -200,7 +247,11 @@ class SpeakerDiarization(base.Pipeline):
             seg = SlidingWindowFeature(seg.cpu().numpy(), sw)
 
             # Update clustering state and permute segmentation
+            clust_start = time.time()
             permuted_seg = self.clustering(seg, emb)
+            clust_time = time.time() - clust_start
+            self._clustering_times.append(clust_time)
+            logger.debug(f"[SpeakerDiarization] Clustering for chunk {idx} took {clust_time:.3f}s")
 
             # Update sliding buffer
             self.chunk_buffer.append(wav)
@@ -230,5 +281,16 @@ class SpeakerDiarization(base.Pipeline):
             if len(self.chunk_buffer) == self.pred_aggregation.num_overlapping_windows:
                 self.chunk_buffer = self.chunk_buffer[1:]
                 self.pred_buffer = self.pred_buffer[1:]
+
+        # Track processing time and output interval
+        processing_time = time.time() - start_time
+        self._total_processing_time += processing_time
+
+        current_time = time.time()
+        if self._last_output_time:
+            output_interval = current_time - self._last_output_time
+            if output_interval > self.config.step * 2:
+                logger.warning(f"[SpeakerDiarization] Large output interval: {output_interval:.3f}s (expected ~{self.config.step}s)")
+        self._last_output_time = current_time
 
         return outputs

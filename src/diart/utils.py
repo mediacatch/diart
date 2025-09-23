@@ -1,4 +1,5 @@
 import base64
+import logging
 import time
 from typing import Optional, Text, Union
 
@@ -8,6 +9,169 @@ from pyannote.core import Annotation, Segment, SlidingWindowFeature, notebook
 
 from . import blocks
 from .progress import ProgressBar
+
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import pynvml as nvml
+
+    nvml.nvmlInit()
+    HAS_NVIDIA_ML_PY = True
+except (ImportError, Exception):
+    HAS_NVIDIA_ML_PY = False
+
+
+class SystemMonitor:
+    """Monitor system resources including CPU, RAM, GPU, and VRAM."""
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.logger = logger or logging.getLogger(__name__)
+        self._check_dependencies()
+
+    def _check_dependencies(self):
+        """Log warnings for missing dependencies."""
+        if not HAS_PSUTIL:
+            self.logger.warning("psutil not available - CPU/RAM monitoring disabled")
+
+    def get_cpu_info(self) -> dict:
+        """Get CPU utilization information."""
+        if not HAS_PSUTIL:
+            return {"cpu_percent": None, "error": "psutil not available"}
+
+        try:
+            return {
+                "cpu_percent": psutil.cpu_percent(interval=0.1),
+                "cpu_count": psutil.cpu_count(),
+                "load_avg": psutil.getloadavg()
+                if hasattr(psutil, "getloadavg")
+                else None,
+            }
+        except Exception as e:
+            return {"cpu_percent": None, "error": str(e)}
+
+    def get_memory_info(self) -> dict:
+        """Get RAM utilization information."""
+        if not HAS_PSUTIL:
+            return {"memory_percent": None, "error": "psutil not available"}
+
+        try:
+            memory = psutil.virtual_memory()
+            return {
+                "memory_percent": memory.percent,
+                "memory_used_gb": memory.used / (1024**3),
+                "memory_total_gb": memory.total / (1024**3),
+                "memory_available_gb": memory.available / (1024**3),
+            }
+        except Exception as e:
+            return {"memory_percent": None, "error": str(e)}
+
+    def get_gpu_info(self) -> dict:
+        """Get GPU utilization and VRAM information."""
+        gpu_info = {
+            "gpu_count": 0,
+            "gpus": [],
+            "torch_gpu_available": False,
+            "torch_gpu_count": 0,
+        }
+
+        # Try nvidia-ml-py first (recommended), then pynvml (deprecated)
+        if HAS_NVIDIA_ML_PY:
+            try:
+                device_count = nvml.nvmlDeviceGetCount()
+                gpu_info["gpu_count"] = device_count
+
+                for i in range(device_count):
+                    handle = nvml.nvmlDeviceGetHandleByIndex(i)
+
+                    # Get memory info
+                    mem_info = nvml.nvmlDeviceGetMemoryInfo(handle)
+                    vram_used_gb = mem_info.used / (1024**3)
+                    vram_total_gb = mem_info.total / (1024**3)
+                    vram_percent = (mem_info.used / mem_info.total) * 100
+
+                    # Get utilization
+                    try:
+                        util_rates = nvml.nvmlDeviceGetUtilizationRates(handle)
+                        gpu_util = util_rates.gpu
+                    except:
+                        gpu_util = None
+
+                    # Get name
+                    try:
+                        name = nvml.nvmlDeviceGetName(handle).decode("utf-8")
+                    except:
+                        name = f"GPU {i}"
+
+                    gpu_info["gpus"].append(
+                        {
+                            "id": i,
+                            "name": name,
+                            "gpu_util_percent": gpu_util,
+                            "vram_used_gb": vram_used_gb,
+                            "vram_total_gb": vram_total_gb,
+                            "vram_percent": vram_percent,
+                        }
+                    )
+
+                return gpu_info
+
+            except Exception as e:
+                gpu_info["nvidia_ml_py_error"] = str(e)
+
+        if not gpu_info["gpus"]:
+            gpu_info["error"] = "No GPU monitoring libraries available or no GPUs found"
+
+        return gpu_info
+
+    def get_all_info(self) -> dict:
+        """Get all system information."""
+        return {
+            "timestamp": time.time(),
+            "cpu": self.get_cpu_info(),
+            "memory": self.get_memory_info(),
+            "gpu": self.get_gpu_info(),
+        }
+
+    def log_system_info(self, prefix: str = "SYSTEM", level: int = logging.INFO):
+        """Log current system resource usage."""
+        info = self.get_all_info()
+
+        # Format CPU info
+        cpu_info = info["cpu"]
+        if cpu_info.get("cpu_percent") is not None:
+            cpu_msg = f"CPU: {cpu_info['cpu_percent']:.1f}%"
+            if cpu_info.get("load_avg"):
+                cpu_msg += f" (load: {cpu_info['load_avg'][0]:.2f})"
+        else:
+            cpu_msg = f"CPU: N/A ({cpu_info.get('error', 'unknown error')})"
+
+        # Format memory info
+        mem_info = info["memory"]
+        if mem_info.get("memory_percent") is not None:
+            mem_msg = f"RAM: {mem_info['memory_percent']:.1f}% ({mem_info['memory_used_gb']:.1f}/{mem_info['memory_total_gb']:.1f}GB)"
+        else:
+            mem_msg = f"RAM: N/A ({mem_info.get('error', 'unknown error')})"
+
+        # Format GPU info
+        gpu_info = info["gpu"]
+        if gpu_info["gpus"]:
+            gpu_msgs = []
+            for gpu in gpu_info["gpus"]:
+                gpu_util = gpu.get("gpu_util_percent")
+                gpu_util_str = f"{gpu_util:.1f}%" if gpu_util is not None else "N/A"
+                vram_str = f"{gpu['vram_percent']:.1f}% ({gpu['vram_used_gb']:.1f}/{gpu['vram_total_gb']:.1f}GB)"
+                gpu_msgs.append(f"GPU{gpu['id']}: {gpu_util_str} util, {vram_str} VRAM")
+            gpu_msg = " | ".join(gpu_msgs)
+        else:
+            gpu_msg = f"GPU: N/A ({gpu_info.get('error', 'no GPUs found')})"
+
+        # Log the combined message
+        self.logger.log(level, f"[{prefix}] {cpu_msg} | {mem_msg} | {gpu_msg}")
 
 
 class Chronometer:

@@ -1,4 +1,5 @@
 from typing import Optional, Union, Text
+import logging
 
 import torch
 from einops import rearrange
@@ -6,15 +7,21 @@ from einops import rearrange
 from ..features import TemporalFeatures, TemporalFeatureFormatter
 from ..models import SegmentationModel
 
+logger = logging.getLogger(__name__)
+
 
 class SpeakerSegmentation:
-    def __init__(self, model: SegmentationModel, device: Optional[torch.device] = None):
+    def __init__(self, model: SegmentationModel, device: Optional[torch.device] = None, use_compile: bool = False):
         self.model = model
         self.model.eval()
         self.device = device
         if self.device is None:
             self.device = torch.device("cpu")
         self.model.to(self.device)
+        logger.info(f"SpeakerSegmentation model placed on device: {self.device}")
+        if use_compile:
+            self.model = torch.compile(self.model)
+            logger.info("SpeakerSegmentation model compiled with torch.compile")
         self.formatter = TemporalFeatureFormatter()
 
     @staticmethod
@@ -22,9 +29,10 @@ class SpeakerSegmentation:
         model,
         use_hf_token: Union[Text, bool, None] = True,
         device: Optional[torch.device] = None,
+        use_compile: bool = False,
     ) -> "SpeakerSegmentation":
         seg_model = SegmentationModel.from_pretrained(model, use_hf_token)
-        return SpeakerSegmentation(seg_model, device)
+        return SpeakerSegmentation(seg_model, device, use_compile)
 
     def __call__(self, waveform: TemporalFeatures) -> TemporalFeatures:
         """

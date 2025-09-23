@@ -1,4 +1,5 @@
 import logging
+import time
 from multiprocessing import Pool, freeze_support, RLock, current_process
 from pathlib import Path
 from traceback import print_exc
@@ -72,6 +73,13 @@ class StreamingInference:
         self.unit = "chunk" if self.batch_size == 1 else "batch"
         self._observers = []
 
+        # Track stream flow statistics
+        self._stream_start_time = None
+        self._chunks_processed = 0
+        self._last_chunk_time = None
+        self._stream_errors = []
+
+
         chunk_duration = self.pipeline.config.duration
         step_duration = self.pipeline.config.step
         sample_rate = self.pipeline.config.sample_rate
@@ -103,6 +111,7 @@ class StreamingInference:
             dops.rearrange_audio_stream(
                 chunk_duration, step_duration, source.sample_rate
             ),
+            ops.do_action(on_next=self._track_chunk),
         )
 
         # Dynamic resampling if the audio source isn't compatible
@@ -134,7 +143,9 @@ class StreamingInference:
                 ops.do_action(on_next=lambda _: self._chrono.stop()),
             )
         else:
-            self.stream = self.stream.pipe(ops.map(self.pipeline))
+            self.stream = self.stream.pipe(
+                ops.map(self.pipeline),
+            )
 
         self.stream = self.stream.pipe(
             ops.flat_map(lambda results: rx.from_iterable(results)),
@@ -155,6 +166,22 @@ class StreamingInference:
             if self._chrono.is_running:
                 self._chrono.stop(do_count=False)
             self._chrono.report()
+
+    def _track_chunk(self, chunk):
+        """Track incoming audio chunks"""
+        current_time = time.time()
+        if self._stream_start_time is None:
+            self._stream_start_time = current_time
+
+        self._chunks_processed += 1
+
+        if self._last_chunk_time:
+            interval = current_time - self._last_chunk_time
+            expected_interval = self.pipeline.config.step
+            if interval > expected_interval * 2:
+                logging.warning(f"[StreamingInference] Large chunk interval: {interval:.3f}s (expected ~{expected_interval:.3f}s)")
+
+        self._last_chunk_time = current_time
 
     def attach_hooks(
         self, *hooks: Callable[[Tuple[Annotation, SlidingWindowFeature]], None]
@@ -180,6 +207,9 @@ class StreamingInference:
         self._observers.extend(observers)
 
     def _handle_error(self, error: BaseException):
+        logging.error(f"[StreamingInference] Error occurred: {error}", exc_info=True)
+        self._stream_errors.append((time.time(), str(error)))
+
         # Compensate for Rx not always calling on_error
         for sink in self._observers:
             sink.on_error(error)
@@ -193,6 +223,11 @@ class StreamingInference:
         # Close internal states
         self._close_pbar()
         self._close_chronometer()
+
+        # Log final statistics
+        if self._stream_start_time:
+            total_time = time.time() - self._stream_start_time
+            logging.debug(f"[StreamingInference] Stream ended with error after {total_time:.1f}s, {self._chunks_processed} chunks processed")
 
     def _handle_completion(self):
         # Close internal states
