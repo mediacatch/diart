@@ -140,9 +140,6 @@ class SpeakerDiarization(base.Pipeline):
         # Track statistics
         self._call_count = 0
         self._total_processing_time = 0
-        self._segmentation_times = []
-        self._embedding_times = []
-        self._clustering_times = []
         self._last_output_time = None
 
         self.reset()
@@ -178,9 +175,6 @@ class SpeakerDiarization(base.Pipeline):
         self.chunk_buffer, self.pred_buffer = [], []
         self._call_count = 0
         self._total_processing_time = 0
-        self._segmentation_times = []
-        self._embedding_times = []
-        self._clustering_times = []
         self._last_output_time = None
 
     def __call__(
@@ -215,22 +209,24 @@ class SpeakerDiarization(base.Pipeline):
         assert batch.shape[1] == expected_num_samples, msg
 
         # Extract segmentation and embeddings
-        self.system_monitor.log_system_info("PRE-SEGMENTATION", logging.DEBUG)
+        system_info = self.system_monitor.get_system_info("PRE-SEGMENTATION")
 
         seg_start = time.time()
         segmentations = self.segmentation(batch)  # shape (batch, frames, speakers)
         seg_time = time.time() - seg_start
-        self._segmentation_times.append(seg_time)
-        logger.debug(f"[SpeakerDiarization] Segmentation took {seg_time:.5f}s, shape: {segmentations.shape}")
+        if seg_time > self._config.step:
+            logger.debug(system_info)
+            logger.debug(f"[SpeakerDiarization] Segmentation took {seg_time:.5f}s, shape: {segmentations.shape}")
 
         # embeddings has shape (batch, speakers, emb_dim)
-        self.system_monitor.log_system_info("PRE-EMBEDDING", logging.DEBUG)
+        system_info = self.system_monitor.get_system_info("PRE-EMBEDDING")
 
         emb_start = time.time()
         embeddings = self.embedding(batch, segmentations)
         emb_time = time.time() - emb_start
-        self._embedding_times.append(emb_time)
-        logger.debug(f"[SpeakerDiarization] Embedding extraction took {emb_time:.5f}s, shape: {embeddings.shape}")
+        if emb_time > self._config.step:
+            logger.debug(system_info)
+            logger.debug(f"[SpeakerDiarization] Embedding extraction took {emb_time:.5f}s, shape: {embeddings.shape}")
 
         seg_resolution = waveforms[0].extent.duration / segmentations.shape[1]
 
@@ -248,7 +244,6 @@ class SpeakerDiarization(base.Pipeline):
             clust_start = time.time()
             permuted_seg = self.clustering(seg, emb)
             clust_time = time.time() - clust_start
-            self._clustering_times.append(clust_time)
             logger.debug(f"[SpeakerDiarization] Clustering for chunk {idx} took {clust_time:.3f}s")
 
             # Update sliding buffer
