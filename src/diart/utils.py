@@ -137,7 +137,7 @@ class SystemMonitor:
             "gpu": self.get_gpu_info(),
         }
 
-    def log_system_info(self, prefix: str = "SYSTEM", level: int = logging.INFO):
+    def get_system_info(self, prefix: str = "SYSTEM"):
         """Log current system resource usage."""
         info = self.get_all_info()
 
@@ -171,7 +171,7 @@ class SystemMonitor:
             gpu_msg = f"GPU: N/A ({gpu_info.get('error', 'no GPUs found')})"
 
         # Log the combined message
-        self.logger.log(level, f"[{prefix}] {cpu_msg} | {mem_msg} | {gpu_msg}")
+        return f"[{prefix}] {cpu_msg} | {mem_msg} | {gpu_msg}"
 
 
 class Chronometer:
