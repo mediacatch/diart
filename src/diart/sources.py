@@ -258,6 +258,10 @@ class FFmpegAudioSource(AudioSource):
 
         # Track restart statistics
         self._last_restart_time = 0
+        self._startup_time = time.time()
+
+        # Restart/pause control
+        self._restart_in_progress = threading.Event()
 
         self._ffmpeg_cmd = self._build_ffmpeg_command()
 
@@ -303,10 +307,18 @@ class FFmpegAudioSource(AudioSource):
         """Restart the FFmpeg process when audio stream issues are detected."""
         current_time = time.time()
 
+        # Prevent restarts within 30 seconds of startup
+        if current_time - self._startup_time < 30.0:
+            logger.debug('[FFmpegAudioSource] Skipping restart - within 30 seconds of startup')
+            return False
+
         # Prevent too frequent restarts (at least 5 seconds apart)
         if current_time - self._last_restart_time < 5.0:
             logger.debug('[FFmpegAudioSource] Skipping restart - too recent')
             return False
+
+        # Signal that restart is in progress to pause the read loop
+        self._restart_in_progress.set()
 
         # Stop current process
         if self._ffmpeg_process:
@@ -341,9 +353,13 @@ class FFmpegAudioSource(AudioSource):
             )
             self._last_restart_time = current_time
             logger.info('[FFmpegAudioSource] FFmpeg process restarted successfully')
+            # Clear the restart flag to resume the read loop
+            self._restart_in_progress.clear()
             return True
         except Exception as e:
             logger.error(f'[FFmpegAudioSource] Failed to restart FFmpeg: {e}')
+            # Clear the restart flag even on failure
+            self._restart_in_progress.clear()
             return False
 
     def _read_ffmpeg_output(self):
@@ -359,6 +375,10 @@ class FFmpegAudioSource(AudioSource):
 
         while not self._stop_flag.is_set() and self._ffmpeg_process:
             try:
+                if self._restart_in_progress.is_set():
+                    while self._restart_in_progress.is_set() and not self._stop_flag.is_set():
+                        time.sleep(0.01)
+                    continue
                 if self._ffmpeg_process.poll() is not None:
                     # Process has terminated
                     returncode = self._ffmpeg_process.returncode
@@ -465,6 +485,9 @@ class FFmpegAudioSource(AudioSource):
     def read(self):
         """Read audio chunks from the microphone via FFmpeg."""
         try:
+            # Ensure restart flag is cleared at start
+            self._restart_in_progress.clear()
+
             # Start FFmpeg process with unbuffered output
             self._ffmpeg_process = subprocess.Popen(
                 self._ffmpeg_cmd,
