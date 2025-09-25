@@ -178,7 +178,11 @@ class StreamingInference:
         if self._last_chunk_time:
             interval = current_time - self._last_chunk_time
             expected_interval = self.pipeline.config.step
-            if interval > expected_interval * 2:
+            if interval > expected_interval * 3:
+                try:
+                    self.source.restart()
+                except Exception as e:
+                    logging.error(f"[StreamingInference] Failed to restart source: {e}", exc_info=True)
                 logging.warning(f"[StreamingInference] Large chunk interval: {interval:.3f}s (expected ~{expected_interval:.3f}s)")
 
         self._last_chunk_time = current_time
