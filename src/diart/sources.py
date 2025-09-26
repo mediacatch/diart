@@ -322,6 +322,7 @@ class FFmpegAudioSource(AudioSource):
 
         # Signal that restart is in progress to pause the read loop
         self._restart_in_progress.set()
+        logger.setLevel(logging.INFO)
 
         # Stop current process
         if self._ffmpeg_process:
@@ -366,7 +367,6 @@ class FFmpegAudioSource(AudioSource):
         except Exception as e:
             logger.error(f'[FFmpegAudioSource] Failed to restart FFmpeg: {e}')
             # Clear the restart flag even on failure
-            logger.debug('[FFmpegAudioSource] Clearing restart in progress flag (after failure)')
             self._restart_in_progress.clear()
             return False
 
