@@ -320,32 +320,47 @@ class FFmpegAudioSource(AudioSource):
             return False
 
         # Signal that restart is in progress to pause the read loop
+        logger.debug('[FFmpegAudioSource] Setting restart in progress flag')
         self._restart_in_progress.set()
 
         # Stop current process
+        logger.debug('[FFmpegAudioSource] Stopping current FFmpeg process')
         if self._ffmpeg_process:
             try:
+                logger.debug('[FFmpegAudioSource] Terminating FFmpeg process')
                 self._ffmpeg_process.terminate()
+                logger.debug('[FFmpegAudioSource] Waiting for FFmpeg process to terminate')
                 self._ffmpeg_process.wait(timeout=2.0)
-            except Exception:
+                logger.debug('[FFmpegAudioSource] FFmpeg process terminated successfully')
+            except subprocess.TimeoutExpired:
+                logger.debug('[FFmpegAudioSource] FFmpeg terminate timeout, killing process')
                 try:
                     self._ffmpeg_process.kill()
                     self._ffmpeg_process.wait()
-                except Exception:
-                    pass
+                    logger.debug('[FFmpegAudioSource] FFmpeg process killed successfully')
+                except Exception as e:
+                    logger.error(f'[FFmpegAudioSource] Error killing FFmpeg process: {e}')
+            except Exception as e:
+                logger.error(f'[FFmpegAudioSource] Error terminating FFmpeg process: {e}')
 
         # Clear buffer
+        logger.debug('[FFmpegAudioSource] Clearing audio buffer')
         with self._buffer_lock:
             self._audio_buffer = BytesIO()
 
         # Clear queue
+        logger.debug('[FFmpegAudioSource] Clearing queue')
+        cleared_items = 0
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
+                cleared_items += 1
             except Exception:
                 break
+        logger.debug(f'[FFmpegAudioSource] Cleared {cleared_items} items from queue')
 
         # Start new process
+        logger.debug('[FFmpegAudioSource] Starting new FFmpeg process')
         try:
             self._ffmpeg_process = subprocess.Popen(
                 self._ffmpeg_cmd,
@@ -356,11 +371,13 @@ class FFmpegAudioSource(AudioSource):
             self._last_restart_time = current_time
             logger.info('[FFmpegAudioSource] FFmpeg process restarted successfully')
             # Clear the restart flag to resume the read loop
+            logger.debug('[FFmpegAudioSource] Clearing restart in progress flag')
             self._restart_in_progress.clear()
             return True
         except Exception as e:
             logger.error(f'[FFmpegAudioSource] Failed to restart FFmpeg: {e}')
             # Clear the restart flag even on failure
+            logger.debug('[FFmpegAudioSource] Clearing restart in progress flag (after failure)')
             self._restart_in_progress.clear()
             return False
 
