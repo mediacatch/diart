@@ -283,8 +283,6 @@ class FFmpegAudioSource(AudioSource):
             '32',
             '-analyzeduration',
             '0',
-            '-buffer_size',
-            '64',  # Small ALSA buffer
             '-i',
             self.device,
             '-af',
