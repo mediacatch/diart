@@ -2,6 +2,7 @@ import cProfile
 import io
 import logging
 import pstats
+import select
 import subprocess
 import threading
 import time
@@ -23,7 +24,7 @@ from . import utils
 from .audio import AudioLoader, FilePath
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)  # Reduce logging overhead
 
 
 
@@ -383,10 +384,9 @@ class FFmpegAudioSource(AudioSource):
         max_consecutive_errors = 10
         last_read_time = time.time()
         last_chunk_time = time.time()
-        last_data_time = time.time()  # Track when we last got actual data
         timeout_seconds = 5.0
+        read_timeout = 1.0
         read_chunk_size = 1024  # Read in smaller chunks from ffmpeg to reduce buffering
-        data_timeout_seconds = 2.0  # Detect data stalls faster than full timeout
 
         # Profiling setup
         profiler = cProfile.Profile()
@@ -428,38 +428,29 @@ class FFmpegAudioSource(AudioSource):
                             )
                     break
 
-                # Check for data stalls before attempting read
-                current_time = time.time()
-                data_stall_duration = current_time - last_data_time
-                if data_stall_duration > data_timeout_seconds:
-                    logger.warning(f'[FFmpegAudioSource] Data stall detected: no data for {data_stall_duration:.1f}s - attempting restart')
-                    # Try to restart FFmpeg on data stall
-                    if self._restart_ffmpeg():
-                        # Reset timing after successful restart
-                        last_read_time = current_time
-                        last_chunk_time = current_time
-                        last_data_time = current_time
-                        # Reset error counters and continue with new process
-                        consecutive_errors = 0
-                        continue
-                    else:
-                        logger.error('[FFmpegAudioSource] Restart failed after data stall, stopping reader thread')
-                        break
 
-                # Read available data from ffmpeg (non-blocking style with timeout)
+                # Use select to check if data is available with timeout
                 read_start = time.time()
                 try:
-                    audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
-                    read_duration = time.time() - read_start
-                    if audio_bytes:
-                        last_data_time = time.time()
-                        logger.debug(f'[FFmpegAudioSource] Read {len(audio_bytes)} bytes from FFmpeg (read took {read_duration:.4f}s)')
-                    elif read_duration > 0.1:  # Log slow reads even with no data
-                        logger.debug(f'[FFmpegAudioSource] Slow read operation: {read_duration:.4f}s with no data')
-                except Exception as e:
-                    logger.error(
-                        f'[FFmpegAudioSource] Error reading from ffmpeg stdout: {e}'
+                    # Check if data is available to read (with timeout)
+                    readable, _, _ = select.select(
+                        [self._ffmpeg_process.stdout], [], [], read_timeout
                     )
+                    
+                    if readable:
+                        # Data is available, read it (this should not block)
+                        audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
+                        read_duration = time.time() - read_start
+                        
+                        if read_duration > 0.1:
+                            logger.warning(f'[FFmpegAudioSource] FFmpeg read took {read_duration:.3f}s (expected <0.1s)')
+                    else:
+                        # Timeout occurred - no data available
+                        audio_bytes = None
+                        logger.debug(f'[FFmpegAudioSource] Read timeout after {read_timeout}s')
+                        
+                except Exception as e:
+                    logger.error(f'[FFmpegAudioSource] Error reading from ffmpeg stdout: {e}')
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         break
@@ -469,10 +460,7 @@ class FFmpegAudioSource(AudioSource):
                     # No data available - check for timeout
                     current_time = time.time()
                     no_data_duration = current_time - last_read_time
-                    data_stall_duration = current_time - last_data_time
 
-                    if no_data_duration > 1.0:  # Log every second when no data
-                        logger.debug(f'[FFmpegAudioSource] No data for {no_data_duration:.1f}s (data stall: {data_stall_duration:.1f}s)')
 
                     if no_data_duration > timeout_seconds:
                         logger.warning(
@@ -483,7 +471,6 @@ class FFmpegAudioSource(AudioSource):
                             # Reset timing after successful restart
                             last_read_time = time.time()
                             last_chunk_time = time.time()
-                            last_data_time = time.time()
                             # Reset error counters and continue with new process
                             consecutive_errors = 0
                             continue
@@ -502,12 +489,10 @@ class FFmpegAudioSource(AudioSource):
                 lock_acquire_start = time.time()
                 with self._buffer_lock:
                     lock_acquire_time = time.time() - lock_acquire_start
-                    buffer_process_start = time.time()
                     if lock_acquire_time > self.block_duration:
                         logger.warning(f'[FFmpegAudioSource] Buffer lock took {lock_acquire_time:.3f}s to acquire (expected <{self.block_duration:.3f}s)')
                     self._audio_buffer.write(audio_bytes)
                     buffer_size = self._audio_buffer.tell()
-                    logger.debug(f'[FFmpegAudioSource] Buffer size after write: {buffer_size} bytes (need {self.block_size_bytes} for complete block)')
 
                     # Check if we have enough data for one or more complete blocks
                     blocks_processed = 0
@@ -543,9 +528,8 @@ class FFmpegAudioSource(AudioSource):
                         # Try to put in queue
                         try:
                             self._queue.put(audio_data, block=False)
-                            logger.debug(f'[FFmpegAudioSource] Added block {blocks_processed} to queue (chunk interval: {chunk_interval:.3f}s)')
-                        except Exception as e:
-                            logger.debug(f'[FFmpegAudioSource] Failed to add block to queue: {e}')
+                        except Exception:
+                            pass
 
                         # Remove processed data from buffer
                         remaining = self._audio_buffer.read()
@@ -553,9 +537,6 @@ class FFmpegAudioSource(AudioSource):
                         self._audio_buffer.write(remaining)
                         buffer_size = len(remaining)
 
-                    buffer_process_time = time.time() - buffer_process_start
-                    if blocks_processed > 0:
-                        logger.debug(f'[FFmpegAudioSource] Processed {blocks_processed} blocks, {buffer_size} bytes remaining in buffer (buffer processing took {buffer_process_time:.4f}s)')
 
                 # Stop profiling for this iteration
                 profiler.disable()
@@ -569,8 +550,6 @@ class FFmpegAudioSource(AudioSource):
                     last_profile_report = current_time
                     profile_on_chunk_interval = False
 
-                if loop_duration > 0.1:  # Log slow loop iterations
-                    logger.debug(f'[FFmpegAudioSource] Slow loop iteration: {loop_duration:.4f}s')
                 time.sleep(0.01)
 
                 # Handle restart outside the buffer lock to avoid deadlock
@@ -674,7 +653,6 @@ class FFmpegAudioSource(AudioSource):
                     try:
                         chunk = self._queue.get(timeout=0.05)
                         empty_queue_count = 0
-                        logger.debug(f'[FFmpegAudioSource] Got chunk from queue, queue size: {self._queue.qsize()}')
                     except Empty:
                         empty_queue_count += 1
 
