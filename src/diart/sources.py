@@ -278,11 +278,13 @@ class FFmpegAudioSource(AudioSource):
             '-f',
             'alsa',
             '-thread_queue_size',
-            '4096',
+            '1024',  # Reduced from 4096 to minimize buffering
             '-probesize',
             '32',
             '-analyzeduration',
             '0',
+            '-buffer_size',
+            '64',  # Small ALSA buffer
             '-i',
             self.device,
             '-af',
@@ -296,11 +298,13 @@ class FFmpegAudioSource(AudioSource):
             '-f',
             'f32le',
             '-fflags',
-            'nobuffer+flush_packets',
+            'nobuffer+flush_packets+discardcorrupt',
             '-flags',
             'low_delay',
             '-avioflags',
             'direct',
+            '-flush_packets',
+            '1',  # Force packet flushing
             '-',  # Output to stdout
         ]
         return cmd
@@ -379,7 +383,7 @@ class FFmpegAudioSource(AudioSource):
         last_read_time = time.time()
         last_chunk_time = time.time()
         timeout_seconds = 5.0
-        read_chunk_size = 4096  # Read in smaller chunks from ffmpeg
+        read_chunk_size = 1024  # Read in smaller chunks from ffmpeg to reduce buffering
 
         while not self._stop_flag.is_set() and self._ffmpeg_process:
             try:
