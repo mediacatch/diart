@@ -440,6 +440,7 @@ class FFmpegAudioSource(AudioSource):
                     if readable:
                         # Data is available, read it (this should not block)
                         audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
+                        pass
                         read_duration = time.time() - read_start
                         
                         if read_duration > 0.1:
