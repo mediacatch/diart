@@ -22,6 +22,28 @@ from .audio import AudioLoader, FilePath
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+# Rate limiter to prevent log spam
+_log_rate_limiter = {}
+
+def _rate_limited_log(level, template, *args, rate_limit_seconds=5.0, **kwargs):
+    """Log a message only if it hasn't been logged recently.
+
+    Args:
+        level: Log level ('debug', 'info', 'warning', 'error')
+        template: Message template string
+        *args, **kwargs: Arguments for template.format()
+        rate_limit_seconds: Minimum seconds between identical template logs
+    """
+    import time
+    current_time = time.time()
+
+    if template not in _log_rate_limiter or current_time - _log_rate_limiter[template] >= rate_limit_seconds:
+        _log_rate_limiter[template] = current_time
+        message = template.format(*args, **kwargs)
+        getattr(logger, level)(message)
+        return True
+    return False
+
 
 class AudioSource(ABC):
     """Represents a source of audio that can start streaming via the `stream` property.
@@ -320,37 +342,27 @@ class FFmpegAudioSource(AudioSource):
             return False
 
         # Signal that restart is in progress to pause the read loop
-        logger.debug('[FFmpegAudioSource] Setting restart in progress flag')
         self._restart_in_progress.set()
 
         # Stop current process
-        logger.debug('[FFmpegAudioSource] Stopping current FFmpeg process')
         if self._ffmpeg_process:
             try:
-                logger.debug('[FFmpegAudioSource] Terminating FFmpeg process')
                 self._ffmpeg_process.terminate()
-                logger.debug('[FFmpegAudioSource] Waiting for FFmpeg process to terminate')
                 self._ffmpeg_process.wait(timeout=2.0)
-                logger.debug('[FFmpegAudioSource] FFmpeg process terminated successfully')
             except subprocess.TimeoutExpired:
-                logger.debug('[FFmpegAudioSource] FFmpeg terminate timeout, killing process')
                 try:
                     self._ffmpeg_process.kill()
                     self._ffmpeg_process.wait()
-                    logger.debug('[FFmpegAudioSource] FFmpeg process killed successfully')
                 except Exception as e:
                     logger.error(f'[FFmpegAudioSource] Error killing FFmpeg process: {e}')
             except Exception as e:
                 logger.error(f'[FFmpegAudioSource] Error terminating FFmpeg process: {e}')
 
         # Clear buffer
-        logger.debug('[FFmpegAudioSource] Clearing audio buffer')
         with self._buffer_lock:
             self._audio_buffer = BytesIO()
-        logger.debug('[FFmpegAudioSource] Audio buffer cleared successfully')
 
         # Clear queue
-        logger.debug('[FFmpegAudioSource] Clearing queue')
         cleared_items = 0
         while not self._queue.empty():
             try:
@@ -358,10 +370,8 @@ class FFmpegAudioSource(AudioSource):
                 cleared_items += 1
             except Exception:
                 break
-        logger.debug(f'[FFmpegAudioSource] Cleared {cleared_items} items from queue')
 
         # Start new process
-        logger.debug('[FFmpegAudioSource] Starting new FFmpeg process')
         try:
             self._ffmpeg_process = subprocess.Popen(
                 self._ffmpeg_cmd,
@@ -372,7 +382,6 @@ class FFmpegAudioSource(AudioSource):
             self._last_restart_time = current_time
             logger.info('[FFmpegAudioSource] FFmpeg process restarted successfully')
             # Clear the restart flag to resume the read loop
-            logger.debug('[FFmpegAudioSource] Clearing restart in progress flag')
             self._restart_in_progress.clear()
             return True
         except Exception as e:
@@ -425,6 +434,8 @@ class FFmpegAudioSource(AudioSource):
                 # Read available data from ffmpeg (non-blocking style with timeout)
                 try:
                     audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
+                    if audio_bytes:
+                        _rate_limited_log('debug', '[FFmpegAudioSource] Read {} bytes from FFmpeg', len(audio_bytes))
                 except Exception as e:
                     logger.error(
                         f'[FFmpegAudioSource] Error reading from ffmpeg stdout: {e}'
@@ -436,7 +447,12 @@ class FFmpegAudioSource(AudioSource):
 
                 if not audio_bytes:
                     # No data available
-                    if time.time() - last_read_time > timeout_seconds:
+                    current_time = time.time()
+                    no_data_duration = current_time - last_read_time
+                    if no_data_duration > 1.0:  # Log every second when no data
+                        _rate_limited_log('debug', '[FFmpegAudioSource] No data for {:.1f}s', no_data_duration)
+
+                    if no_data_duration > timeout_seconds:
                         logger.warning(
                             f'[FFmpegAudioSource] Read timeout: No data for {timeout_seconds}s - attempting restart'
                         )
@@ -460,12 +476,19 @@ class FFmpegAudioSource(AudioSource):
 
                 # Add to buffer
                 restart_needed = False
+                lock_acquire_start = time.time()
                 with self._buffer_lock:
+                    lock_acquire_time = time.time() - lock_acquire_start
+                    if lock_acquire_time > self.block_duration:
+                        logger.warning(f'[FFmpegAudioSource] Buffer lock took {lock_acquire_time:.3f}s to acquire (expected <{self.block_duration:.3f}s)')
                     self._audio_buffer.write(audio_bytes)
                     buffer_size = self._audio_buffer.tell()
+                    _rate_limited_log('debug', '[FFmpegAudioSource] Buffer size after write: {} bytes (need {} for complete block)', buffer_size, self.block_size_bytes)
 
                     # Check if we have enough data for one or more complete blocks
+                    blocks_processed = 0
                     while buffer_size >= self.block_size_bytes:
+                        blocks_processed += 1
                         # Read a complete block from buffer
                         self._audio_buffer.seek(0)
                         block_bytes = self._audio_buffer.read(self.block_size_bytes)
@@ -494,14 +517,18 @@ class FFmpegAudioSource(AudioSource):
                         # Try to put in queue
                         try:
                             self._queue.put(audio_data, block=False)
-                        except Exception:
-                            pass
+                            _rate_limited_log('debug', '[FFmpegAudioSource] Added block {} to queue (chunk interval: {:.3f}s)', blocks_processed, chunk_interval)
+                        except Exception as e:
+                            logger.debug(f'[FFmpegAudioSource] Failed to add block to queue: {e}')
 
                         # Remove processed data from buffer
                         remaining = self._audio_buffer.read()
                         self._audio_buffer = BytesIO()
                         self._audio_buffer.write(remaining)
                         buffer_size = len(remaining)
+
+                    if blocks_processed > 0:
+                        _rate_limited_log('debug', '[FFmpegAudioSource] Processed {} blocks, {} bytes remaining in buffer', blocks_processed, buffer_size)
 
                 # Handle restart outside the buffer lock to avoid deadlock
                 if restart_needed:
@@ -581,6 +608,7 @@ class FFmpegAudioSource(AudioSource):
                     try:
                         chunk = self._queue.get(timeout=0.05)
                         empty_queue_count = 0
+                        _rate_limited_log('debug', '[FFmpegAudioSource] Got chunk from queue, queue size: {}', self._queue.qsize())
                     except Empty:
                         empty_queue_count += 1
 
