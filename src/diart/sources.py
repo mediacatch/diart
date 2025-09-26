@@ -20,6 +20,7 @@ from . import utils
 from .audio import AudioLoader, FilePath
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class AudioSource(ABC):
@@ -377,7 +378,14 @@ class FFmpegAudioSource(AudioSource):
         while not self._stop_flag.is_set() and self._ffmpeg_process:
             try:
                 if self._restart_in_progress.is_set():
+                    restart_wait_start = time.time()
+                    last_log_time = 0
                     while self._restart_in_progress.is_set() and not self._stop_flag.is_set():
+                        current_time = time.time()
+                        if current_time - last_log_time >= 5.0:
+                            wait_duration = current_time - restart_wait_start
+                            logger.info(f'[FFmpegAudioSource] Reader thread waiting for restart completion ({wait_duration:.1f}s)')
+                            last_log_time = current_time
                         time.sleep(0.01)
                     continue
                 if self._ffmpeg_process.poll() is not None:
@@ -419,8 +427,11 @@ class FFmpegAudioSource(AudioSource):
                             # Reset timing after successful restart
                             last_read_time = time.time()
                             last_chunk_time = time.time()
+                            # Reset error counters and continue with new process
+                            consecutive_errors = 0
                             continue
                         else:
+                            logger.error('[FFmpegAudioSource] Restart failed after timeout, stopping reader thread')
                             break
                     time.sleep(0.001)
                     continue
@@ -456,7 +467,13 @@ class FFmpegAudioSource(AudioSource):
                                 # Reset timing after successful restart
                                 last_chunk_time = time.time()
                                 last_read_time = time.time()
-                            continue
+                                # Reset error counters and continue with new process
+                                consecutive_errors = 0
+                                continue
+                            else:
+                                # Restart failed, break out of loop
+                                logger.error('[FFmpegAudioSource] Restart failed, stopping reader thread')
+                                break
                         last_chunk_time = current_time
 
                         # Try to put in queue
@@ -511,6 +528,19 @@ class FFmpegAudioSource(AudioSource):
 
             while not self._stop_flag.is_set():
                 try:
+                    # Wait if restart is in progress
+                    if self._restart_in_progress.is_set():
+                        restart_wait_start = time.time()
+                        last_log_time = 0
+                        while self._restart_in_progress.is_set() and not self._stop_flag.is_set():
+                            current_time = time.time()
+                            if current_time - last_log_time >= 5.0:
+                                wait_duration = current_time - restart_wait_start
+                                logger.info(f'[FFmpegAudioSource] Waiting for restart completion ({wait_duration:.1f}s)')
+                                last_log_time = current_time
+                            time.sleep(0.01)
+                        continue
+
                     # Check if reader thread is still alive
                     if not self._read_thread.is_alive():
                         logger.error(
