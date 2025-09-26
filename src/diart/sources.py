@@ -347,6 +347,7 @@ class FFmpegAudioSource(AudioSource):
         logger.debug('[FFmpegAudioSource] Clearing audio buffer')
         with self._buffer_lock:
             self._audio_buffer = BytesIO()
+        logger.debug('[FFmpegAudioSource] Audio buffer cleared successfully')
 
         # Clear queue
         logger.debug('[FFmpegAudioSource] Clearing queue')
@@ -458,6 +459,7 @@ class FFmpegAudioSource(AudioSource):
                 last_read_time = time.time()
 
                 # Add to buffer
+                restart_needed = False
                 with self._buffer_lock:
                     self._audio_buffer.write(audio_bytes)
                     buffer_size = self._audio_buffer.tell()
@@ -479,18 +481,14 @@ class FFmpegAudioSource(AudioSource):
                         expected_interval = self.block_duration
                         if chunk_interval > expected_interval * 3:  # More than 3x step size
                             logger.warning(f'[FFmpegAudioSource] Large chunk interval: {chunk_interval:.3f}s (expected ~{expected_interval:.3f}s) - attempting restart')
-                            # Try to restart FFmpeg if chunks are too delayed
-                            if self._restart_ffmpeg():
-                                # Reset timing after successful restart
-                                last_chunk_time = time.time()
-                                last_read_time = time.time()
-                                # Reset error counters and continue with new process
-                                consecutive_errors = 0
-                                continue
-                            else:
-                                # Restart failed, break out of loop
-                                logger.error('[FFmpegAudioSource] Restart failed, stopping reader thread')
-                                break
+                            # Need to release buffer lock before restart to avoid deadlock
+                            # Save remaining buffer data first
+                            remaining = self._audio_buffer.read()
+                            self._audio_buffer = BytesIO()
+                            self._audio_buffer.write(remaining)
+                            # Exit the with block to release lock, then restart
+                            restart_needed = True
+                            break
                         last_chunk_time = current_time
 
                         # Try to put in queue
@@ -504,6 +502,20 @@ class FFmpegAudioSource(AudioSource):
                         self._audio_buffer = BytesIO()
                         self._audio_buffer.write(remaining)
                         buffer_size = len(remaining)
+
+                # Handle restart outside the buffer lock to avoid deadlock
+                if restart_needed:
+                    if self._restart_ffmpeg():
+                        # Reset timing after successful restart
+                        last_chunk_time = time.time()
+                        last_read_time = time.time()
+                        # Reset error counters and continue with new process
+                        consecutive_errors = 0
+                        continue
+                    else:
+                        # Restart failed, break out of loop
+                        logger.error('[FFmpegAudioSource] Restart failed, stopping reader thread')
+                        break
 
             except Exception as e:
                 logger.error(f'[FFmpegAudioSource] Error in reader thread: {e}')
