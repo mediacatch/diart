@@ -27,6 +27,79 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Reduce logging overhead
 
 
+def check_audio_system_logs() -> str:
+    """Check system logs for audio-related errors and issues.
+
+    Returns
+    -------
+    str
+        Summary of audio-related log entries found, or empty string if none found.
+    """
+    log_entries = []
+
+    # Check dmesg for kernel messages (works in containers without sudo)
+    try:
+        result = subprocess.run(
+            ['dmesg'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Look for audio-related kernel messages
+            audio_lines = [
+                line for line in result.stdout.split('\n')
+                if any(keyword in line.lower() for keyword in [
+                    'audio', 'sound', 'alsa', 'snd_', 'hda_', 'usb.*audio',
+                    'overrun', 'underrun', 'xrun', 'buffer', 'latency'
+                ])
+            ]
+            if audio_lines:
+                log_entries.extend(audio_lines[-10:])  # Last 10 relevant entries
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    # Check journalctl if available
+    try:
+        result = subprocess.run(
+            ['journalctl', '--system', '-n', '50', '--no-pager'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            audio_lines = [
+                line for line in result.stdout.split('\n')
+                if any(keyword in line.lower() for keyword in [
+                    'audio', 'alsa', 'pulseaudio', 'pipewire', 'jack',
+                    'overrun', 'underrun', 'xrun'
+                ])
+            ]
+            if audio_lines:
+                log_entries.extend(audio_lines[-5:])  # Last 5 relevant entries
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    # Check /var/log/syslog if readable
+    try:
+        with open('/var/log/syslog', 'r') as f:
+            lines = f.readlines()[-100:]  # Last 100 lines
+            audio_lines = [
+                line.strip() for line in lines
+                if any(keyword in line.lower() for keyword in [
+                    'audio', 'alsa', 'overrun', 'underrun'
+                ])
+            ]
+            if audio_lines:
+                log_entries.extend(audio_lines[-3:])  # Last 3 relevant entries
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    if log_entries:
+        return '\n'.join(set(log_entries))  # Remove duplicates
+    return ""
+
+
 
 class AudioSource(ABC):
     """Represents a source of audio that can start streaming via the `stream` property.
@@ -512,7 +585,21 @@ class FFmpegAudioSource(AudioSource):
                         chunk_interval = current_time - last_chunk_time
                         expected_interval = self.block_duration
                         if chunk_interval > expected_interval * 3:  # More than 3x step size
-                            logger.warning(f'[FFmpegAudioSource] Large chunk interval: {chunk_interval:.3f}s (expected ~{expected_interval:.3f}s) - attempting restart')
+                            logger.warning(f'[FFmpegAudioSource] Large output interval: {chunk_interval:.3f}s (expected ~{expected_interval:.3f}s) - attempting restart')
+
+                            # Check system logs for audio-related errors
+                            try:
+                                audio_logs = check_audio_system_logs()
+                                if audio_logs:
+                                    logger.warning('[FFmpegAudioSource] Audio-related system log entries found:')
+                                    for log_line in audio_logs.split('\n')[:5]:  # Show first 5 entries
+                                        if log_line.strip():
+                                            logger.warning(f'[FFmpegAudioSource] SYSTEM: {log_line.strip()}')
+                                else:
+                                    logger.warning('[FFmpegAudioSource] No audio-related errors found in system logs')
+                            except Exception as e:
+                                logger.warning(f'[FFmpegAudioSource] Failed to check system logs: {e}')
+
                             # Trigger profiling report for this problematic iteration
                             profile_on_chunk_interval = True
                             # Need to release buffer lock before restart to avoid deadlock
