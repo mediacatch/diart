@@ -463,8 +463,6 @@ class FFmpegAudioSource(AudioSource):
 
         # Profiling setup
         profiler = cProfile.Profile()
-        last_profile_report = time.time()
-        profile_interval = 10.0  # Report every 10 seconds
         profile_on_chunk_interval = False
 
         while not self._stop_flag.is_set() and self._ffmpeg_process:
@@ -631,10 +629,9 @@ class FFmpegAudioSource(AudioSource):
                 loop_duration = time.time() - loop_start
                 current_time = time.time()
 
-                # Generate profiling reports
-                if profile_on_chunk_interval or (current_time - last_profile_report >= profile_interval):
-                    self._generate_profile_report(profiler, profile_on_chunk_interval, loop_duration)
-                    last_profile_report = current_time
+                # Generate profiling report only for problematic intervals
+                if profile_on_chunk_interval:
+                    self._generate_profile_report(profiler, loop_duration)
                     profile_on_chunk_interval = False
 
                 time.sleep(0.01)
@@ -663,7 +660,7 @@ class FFmpegAudioSource(AudioSource):
                     )
                     break
 
-    def _generate_profile_report(self, profiler, is_problematic, loop_duration=None):
+    def _generate_profile_report(self, profiler, loop_duration=None):
         """Generate and log profiling report."""
         try:
             # Capture profiling stats
@@ -675,16 +672,10 @@ class FFmpegAudioSource(AudioSource):
             stats.print_stats(10)  # Top 10 functions
             profile_output = s.getvalue()
 
-            if is_problematic:
-                logger.warning(f'[FFmpegAudioSource] PROBLEMATIC ITERATION PROFILE (loop: {loop_duration:.4f}s):')
-                for line in profile_output.split('\n')[:15]:  # First 15 lines
-                    if line.strip():
-                        logger.warning(f'[FFmpegAudioSource] {line}')
-            else:
-                logger.info('[FFmpegAudioSource] PERIODIC PROFILE REPORT (10s average):')
-                for line in profile_output.split('\n')[:15]:  # First 15 lines
-                    if line.strip():
-                        logger.info(f'[FFmpegAudioSource] {line}')
+            logger.warning(f'[FFmpegAudioSource] PROBLEMATIC ITERATION PROFILE (loop: {loop_duration:.4f}s):')
+            for line in profile_output.split('\n')[:15]:  # First 15 lines
+                if line.strip():
+                    logger.warning(f'[FFmpegAudioSource] {line}')
         except Exception as e:
             logger.error(f'[FFmpegAudioSource] Error generating profile report: {e}')
 
