@@ -356,8 +356,6 @@ class FFmpegAudioSource(AudioSource):
             '-f',
             'alsa',
             '-thread_queue_size',
-            '4096',
-            '-buffer_size',
             '8192',
             '-probesize',
             '32',
