@@ -330,6 +330,7 @@ class FFmpegAudioSource(AudioSource):
         self._queue = Queue(maxsize=buffer_size)
         self._ffmpeg_process = None
         self._read_thread = None
+        self._stderr_thread = None
         self._stop_flag = threading.Event()
 
         self._audio_buffer = BytesIO()
@@ -448,6 +449,33 @@ class FFmpegAudioSource(AudioSource):
             # Clear the restart flag even on failure
             self._restart_in_progress.clear()
             return False
+
+    def _read_ffmpeg_stderr(self):
+        """Read and log FFmpeg stderr output in a separate thread."""
+        logger.debug('[FFmpegAudioSource] Starting FFmpeg stderr reader thread')
+
+        while not self._stop_flag.is_set() and self._ffmpeg_process:
+            try:
+                if self._restart_in_progress.is_set():
+                    time.sleep(0.01)
+                    continue
+
+                # Check if stderr data is available
+                readable, _, _ = select.select([self._ffmpeg_process.stderr], [], [], 0.1)
+
+                if readable:
+                    line = self._ffmpeg_process.stderr.readline()
+                    if line:
+                        stderr_msg = line.decode('utf-8', errors='ignore').strip()
+                        if stderr_msg:
+                            logger.warning(f'[FFmpegAudioSource] FFmpeg: {stderr_msg}')
+                elif self._ffmpeg_process.poll() is not None:
+                    # Process terminated
+                    break
+
+            except Exception as e:
+                logger.error(f'[FFmpegAudioSource] Error reading FFmpeg stderr: {e}')
+                break
 
     def _read_ffmpeg_output(self):
         """Read audio data from FFmpeg stdout in a separate thread with buffering."""
@@ -693,9 +721,12 @@ class FFmpegAudioSource(AudioSource):
                 bufsize=0,  # Unbuffered
             )
 
-            # Start reader thread
+            # Start reader threads
             self._read_thread = threading.Thread(target=self._read_ffmpeg_output, daemon=True)
             self._read_thread.start()
+
+            self._stderr_thread = threading.Thread(target=self._read_ffmpeg_stderr, daemon=True)
+            self._stderr_thread.start()
 
             empty_queue_count = 0
             max_empty_queue_wait = 1000
@@ -807,12 +838,19 @@ class FFmpegAudioSource(AudioSource):
             except Exception as e:
                 logger.error(f'[FFmpegAudioSource] Error terminating FFmpeg: {e}')
 
-        # Wait for reader thread
+        # Wait for reader threads
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=3.0)
             if self._read_thread.is_alive():
                 logger.warning(
                     '[FFmpegAudioSource] Reader thread did not terminate cleanly'
+                )
+
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=3.0)
+            if self._stderr_thread.is_alive():
+                logger.warning(
+                    '[FFmpegAudioSource] Stderr thread did not terminate cleanly'
                 )
 
     def restart(self) -> bool:
