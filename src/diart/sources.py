@@ -356,7 +356,9 @@ class FFmpegAudioSource(AudioSource):
             '-f',
             'alsa',
             '-thread_queue_size',
-            '1024',  # Reduced from 4096 to minimize buffering
+            '4096',
+            '-buffer_size',
+            '8192',
             '-probesize',
             '32',
             '-analyzeduration',
@@ -487,7 +489,7 @@ class FFmpegAudioSource(AudioSource):
         last_chunk_time = time.time()
         timeout_seconds = 5.0
         read_timeout = 1.0
-        read_chunk_size = 1024  # Read in smaller chunks from ffmpeg to reduce buffering
+        read_chunk_size = 8192  # Read in smaller chunks from ffmpeg to reduce buffering
 
         # Profiling setup
         profiler = cProfile.Profile()
