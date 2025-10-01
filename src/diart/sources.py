@@ -39,20 +39,28 @@ def check_audio_system_logs() -> str:
 
     # Check dmesg for kernel messages (works in containers without sudo)
     try:
-        result = subprocess.run(
-            ['dmesg'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
+        result = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             # Look for audio-related kernel messages
             audio_lines = [
-                line for line in result.stdout.split('\n')
-                if any(keyword in line.lower() for keyword in [
-                    'audio', 'sound', 'alsa', 'snd_', 'hda_', 'usb.*audio',
-                    'overrun', 'underrun', 'xrun', 'buffer', 'latency'
-                ])
+                line
+                for line in result.stdout.split("\n")
+                if any(
+                    keyword in line.lower()
+                    for keyword in [
+                        "audio",
+                        "sound",
+                        "alsa",
+                        "snd_",
+                        "hda_",
+                        "usb.*audio",
+                        "overrun",
+                        "underrun",
+                        "xrun",
+                        "buffer",
+                        "latency",
+                    ]
+                )
             ]
             if audio_lines:
                 log_entries.extend(audio_lines[-10:])  # Last 10 relevant entries
@@ -62,18 +70,28 @@ def check_audio_system_logs() -> str:
     # Check journalctl if available
     try:
         result = subprocess.run(
-            ['journalctl', '--system', '-n', '50', '--no-pager'],
+            ["journalctl", "--system", "-n", "50", "--no-pager"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
         )
         if result.returncode == 0:
             audio_lines = [
-                line for line in result.stdout.split('\n')
-                if any(keyword in line.lower() for keyword in [
-                    'audio', 'alsa', 'pulseaudio', 'pipewire', 'jack',
-                    'overrun', 'underrun', 'xrun'
-                ])
+                line
+                for line in result.stdout.split("\n")
+                if any(
+                    keyword in line.lower()
+                    for keyword in [
+                        "audio",
+                        "alsa",
+                        "pulseaudio",
+                        "pipewire",
+                        "jack",
+                        "overrun",
+                        "underrun",
+                        "xrun",
+                    ]
+                )
             ]
             if audio_lines:
                 log_entries.extend(audio_lines[-5:])  # Last 5 relevant entries
@@ -82,13 +100,15 @@ def check_audio_system_logs() -> str:
 
     # Check /var/log/syslog if readable
     try:
-        with open('/var/log/syslog', 'r') as f:
+        with open("/var/log/syslog", "r") as f:
             lines = f.readlines()[-100:]  # Last 100 lines
             audio_lines = [
-                line.strip() for line in lines
-                if any(keyword in line.lower() for keyword in [
-                    'audio', 'alsa', 'overrun', 'underrun'
-                ])
+                line.strip()
+                for line in lines
+                if any(
+                    keyword in line.lower()
+                    for keyword in ["audio", "alsa", "overrun", "underrun"]
+                )
             ]
             if audio_lines:
                 log_entries.extend(audio_lines[-3:])  # Last 3 relevant entries
@@ -96,9 +116,8 @@ def check_audio_system_logs() -> str:
         pass
 
     if log_entries:
-        return '\n'.join(set(log_entries))  # Remove duplicates
+        return "\n".join(set(log_entries))  # Remove duplicates
     return ""
-
 
 
 class AudioSource(ABC):
@@ -291,6 +310,7 @@ class MicrophoneAudioSource(AudioSource):
         self._mic_stream.stop()
         self._mic_stream.close()
 
+
 class FFmpegAudioSource(AudioSource):
     """Audio source tied to a local microphone using FFmpeg.
 
@@ -320,10 +340,10 @@ class FFmpegAudioSource(AudioSource):
         sample_rate: int = 16000,
         buffer_size: int = 10,
     ):
-        super().__init__(f'ffmpeg_input:{device}', sample_rate)
+        super().__init__(f"ffmpeg_input:{device}", sample_rate)
 
         self.block_duration = block_duration
-        self.device = device if device else 'default'
+        self.device = device if device else "default"
         self.block_size = int(np.rint(block_duration * self.sample_rate))
         self.block_size_bytes = self.block_size * 4  # 32-bit float audio
 
@@ -346,58 +366,93 @@ class FFmpegAudioSource(AudioSource):
         self._ffmpeg_cmd = self._build_ffmpeg_command()
 
     def _build_ffmpeg_command(self):
-        """Build the FFmpeg command for audio capture."""
+        """
+        Build the FFmpeg command for audio capture that:
+        - mixes the ALSA input with an infinite silent source (so output never stops),
+        - fills short gaps with silence,
+        - logs silence events from the real input via silencedetect.
+        """
+        sr = int(self.sample_rate)
+
+        # Filter graph:
+        # [1:a] = real capture -> resample/timestamp -> split into [cap] (for mix) and [mon] (for monitoring)
+        # [0:a] = anullsrc (infinite silence at desired SR/mono)
+        # amix  = mix silence + capture so the output keeps flowing even if capture drops
+        # silencedetect on [mon] prints warnings to stderr when the real input is quiet/missing
+        filter_complex = (
+            "[1:a]"
+            "aresample=async=1:min_comp=0.001:min_hard_comp=0.100:first_pts=0,"
+            "asetpts=N/SR/TB,"
+            "asplit=2[cap][mon];"
+            "[0:a][cap]"
+            "amix=inputs=2:duration=longest:dropout_transition=3[mix];"
+            "[mon]"
+            "silencedetect=noise=-50dB:d=2,anullsink"
+        )
 
         cmd = [
-            'ffmpeg',
-            '-hide_banner',
-            '-loglevel',
-            'warning',
-            '-f',
-            'alsa',
-            '-thread_queue_size',
-            '8192',
-            '-probesize',
-            '32',
-            '-analyzeduration',
-            '0',
-            '-i',
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            # Input 0: infinite silence at target sample rate, mono
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=r={sr}:cl=mono",
+            # Input 1: your ALSA device (use plughw/default if possible for format conversion)
+            "-f",
+            "alsa",
+            "-thread_queue_size",
+            "8192",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-i",
             self.device,
-            '-af',
-            'aresample=async=1:min_comp=0.001:min_hard_comp=0.100:first_pts=0',
-            '-acodec',
-            'pcm_f32le',
-            '-ar',
-            str(self.sample_rate),
-            '-ac',
-            '1',
-            '-f',
-            'f32le',
-            '-fflags',
-            'nobuffer+flush_packets+discardcorrupt',
-            '-flags',
-            'low_delay',
-            '-avioflags',
-            'direct',
-            '-flush_packets',
-            '1',  # Force packet flushing
-            '-',  # Output to stdout
+            # Build the mix + monitor pipeline
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[mix]",  # send the mixed stream (silence+capture) to stdout
+            # Encode/output as raw float32 LE at the requested sample rate, mono
+            "-acodec",
+            "pcm_f32le",
+            "-ar",
+            str(sr),
+            "-ac",
+            "1",
+            "-f",
+            "f32le",
+            # Low-latency / robustness flags
+            "-fflags",
+            "nobuffer+flush_packets+discardcorrupt",
+            "-flags",
+            "low_delay",
+            "-avioflags",
+            "direct",
+            "-flush_packets",
+            "1",
+            "-",  # stdout
         ]
         return cmd
 
     def _restart_ffmpeg(self):
         """Restart the FFmpeg process when audio stream issues are detected."""
         current_time = time.time()
-        logger.info('[FFmpegAudioSource] Attempting to restart FFmpeg process')
+        logger.info("[FFmpegAudioSource] Attempting to restart FFmpeg process")
 
         # Prevent restarts within 30 seconds of startup
         if current_time - self._startup_time < 30.0:
-            logger.debug('[FFmpegAudioSource] Skipping restart - within 30 seconds of startup')
+            logger.debug(
+                "[FFmpegAudioSource] Skipping restart - within 30 seconds of startup"
+            )
             return False
 
         # Prevent too frequent restarts (at least 5 seconds apart)
         if current_time - self._last_restart_time < 5.0:
-            logger.debug('[FFmpegAudioSource] Skipping restart - too recent')
+            logger.debug("[FFmpegAudioSource] Skipping restart - too recent")
             return False
 
         # Signal that restart is in progress to pause the read loop
@@ -414,9 +469,13 @@ class FFmpegAudioSource(AudioSource):
                     self._ffmpeg_process.kill()
                     self._ffmpeg_process.wait()
                 except Exception as e:
-                    logger.error(f'[FFmpegAudioSource] Error killing FFmpeg process: {e}')
+                    logger.error(
+                        f"[FFmpegAudioSource] Error killing FFmpeg process: {e}"
+                    )
             except Exception as e:
-                logger.error(f'[FFmpegAudioSource] Error terminating FFmpeg process: {e}')
+                logger.error(
+                    f"[FFmpegAudioSource] Error terminating FFmpeg process: {e}"
+                )
 
         # Clear buffer
         with self._buffer_lock:
@@ -440,19 +499,19 @@ class FFmpegAudioSource(AudioSource):
                 bufsize=0,
             )
             self._last_restart_time = current_time
-            logger.info('[FFmpegAudioSource] FFmpeg process restarted successfully')
+            logger.info("[FFmpegAudioSource] FFmpeg process restarted successfully")
             # Clear the restart flag to resume the read loop
             self._restart_in_progress.clear()
             return True
         except Exception as e:
-            logger.error(f'[FFmpegAudioSource] Failed to restart FFmpeg: {e}')
+            logger.error(f"[FFmpegAudioSource] Failed to restart FFmpeg: {e}")
             # Clear the restart flag even on failure
             self._restart_in_progress.clear()
             return False
 
     def _read_ffmpeg_stderr(self):
         """Read and log FFmpeg stderr output in a separate thread."""
-        logger.debug('[FFmpegAudioSource] Starting FFmpeg stderr reader thread')
+        logger.debug("[FFmpegAudioSource] Starting FFmpeg stderr reader thread")
 
         while not self._stop_flag.is_set() and self._ffmpeg_process:
             try:
@@ -461,25 +520,27 @@ class FFmpegAudioSource(AudioSource):
                     continue
 
                 # Check if stderr data is available
-                readable, _, _ = select.select([self._ffmpeg_process.stderr], [], [], 0.1)
+                readable, _, _ = select.select(
+                    [self._ffmpeg_process.stderr], [], [], 0.1
+                )
 
                 if readable:
                     line = self._ffmpeg_process.stderr.readline()
                     if line:
-                        stderr_msg = line.decode('utf-8', errors='ignore').strip()
+                        stderr_msg = line.decode("utf-8", errors="ignore").strip()
                         if stderr_msg:
-                            logger.warning(f'[FFmpegAudioSource] FFmpeg: {stderr_msg}')
+                            logger.warning(f"[FFmpegAudioSource] FFmpeg: {stderr_msg}")
                 elif self._ffmpeg_process.poll() is not None:
                     # Process terminated
                     break
 
             except Exception as e:
-                logger.error(f'[FFmpegAudioSource] Error reading FFmpeg stderr: {e}')
+                logger.error(f"[FFmpegAudioSource] Error reading FFmpeg stderr: {e}")
                 break
 
     def _read_ffmpeg_output(self):
         """Read audio data from FFmpeg stdout in a separate thread with buffering."""
-        logger.debug('[FFmpegAudioSource] Starting FFmpeg output reader thread')
+        logger.debug("[FFmpegAudioSource] Starting FFmpeg output reader thread")
 
         consecutive_errors = 0
         max_consecutive_errors = 10
@@ -503,11 +564,16 @@ class FFmpegAudioSource(AudioSource):
                 if self._restart_in_progress.is_set():
                     restart_wait_start = time.time()
                     last_log_time = 0
-                    while self._restart_in_progress.is_set() and not self._stop_flag.is_set():
+                    while (
+                        self._restart_in_progress.is_set()
+                        and not self._stop_flag.is_set()
+                    ):
                         current_time = time.time()
                         if current_time - last_log_time >= 5.0:
                             wait_duration = current_time - restart_wait_start
-                            logger.info(f'[FFmpegAudioSource] Reader thread waiting for restart completion ({wait_duration:.1f}s)')
+                            logger.info(
+                                f"[FFmpegAudioSource] Reader thread waiting for restart completion ({wait_duration:.1f}s)"
+                            )
                             last_log_time = current_time
                         time.sleep(0.01)
                     continue
@@ -515,7 +581,7 @@ class FFmpegAudioSource(AudioSource):
                     # Process has terminated
                     returncode = self._ffmpeg_process.returncode
                     logger.error(
-                        f'[FFmpegAudioSource] FFmpeg process terminated with code {returncode}'
+                        f"[FFmpegAudioSource] FFmpeg process terminated with code {returncode}"
                     )
 
                     # Read any error output
@@ -527,7 +593,6 @@ class FFmpegAudioSource(AudioSource):
                             )
                     break
 
-
                 # Use select to check if data is available with timeout
                 read_start = time.time()
                 try:
@@ -535,21 +600,27 @@ class FFmpegAudioSource(AudioSource):
                     readable, _, _ = select.select(
                         [self._ffmpeg_process.stdout], [], [], read_timeout
                     )
-                    
+
                     if readable:
                         # Data is available, read it (this should not block)
                         audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
                         read_duration = time.time() - read_start
-                        
+
                         if read_duration > 0.1:
-                            logger.warning(f'[FFmpegAudioSource] FFmpeg read took {read_duration:.3f}s (expected <0.1s)')
+                            logger.warning(
+                                f"[FFmpegAudioSource] FFmpeg read took {read_duration:.3f}s (expected <0.1s)"
+                            )
                     else:
                         # Timeout occurred - no data available
                         audio_bytes = None
-                        logger.debug(f'[FFmpegAudioSource] Read timeout after {read_timeout}s')
-                        
+                        logger.debug(
+                            f"[FFmpegAudioSource] Read timeout after {read_timeout}s"
+                        )
+
                 except Exception as e:
-                    logger.error(f'[FFmpegAudioSource] Error reading from ffmpeg stdout: {e}')
+                    logger.error(
+                        f"[FFmpegAudioSource] Error reading from ffmpeg stdout: {e}"
+                    )
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         break
@@ -560,10 +631,9 @@ class FFmpegAudioSource(AudioSource):
                     current_time = time.time()
                     no_data_duration = current_time - last_read_time
 
-
                     if no_data_duration > timeout_seconds:
                         logger.warning(
-                            f'[FFmpegAudioSource] Read timeout: No data for {timeout_seconds}s - attempting restart'
+                            f"[FFmpegAudioSource] Read timeout: No data for {timeout_seconds}s - attempting restart"
                         )
                         # Try to restart FFmpeg on timeout
                         if self._restart_ffmpeg():
@@ -574,7 +644,9 @@ class FFmpegAudioSource(AudioSource):
                             consecutive_errors = 0
                             continue
                         else:
-                            logger.error('[FFmpegAudioSource] Restart failed after timeout, stopping reader thread')
+                            logger.error(
+                                "[FFmpegAudioSource] Restart failed after timeout, stopping reader thread"
+                            )
                             break
                     time.sleep(0.001)
                     continue
@@ -589,7 +661,9 @@ class FFmpegAudioSource(AudioSource):
                 with self._buffer_lock:
                     lock_acquire_time = time.time() - lock_acquire_start
                     if lock_acquire_time > self.block_duration:
-                        logger.warning(f'[FFmpegAudioSource] Buffer lock took {lock_acquire_time:.3f}s to acquire (expected <{self.block_duration:.3f}s)')
+                        logger.warning(
+                            f"[FFmpegAudioSource] Buffer lock took {lock_acquire_time:.3f}s to acquire (expected <{self.block_duration:.3f}s)"
+                        )
                     self._audio_buffer.write(audio_bytes)
                     buffer_size = self._audio_buffer.tell()
 
@@ -610,21 +684,35 @@ class FFmpegAudioSource(AudioSource):
                         current_time = time.time()
                         chunk_interval = current_time - last_chunk_time
                         expected_interval = self.block_duration
-                        if chunk_interval > expected_interval * 3:  # More than 3x step size
-                            logger.warning(f'[FFmpegAudioSource] Large output interval: {chunk_interval:.3f}s (expected ~{expected_interval:.3f}s) - attempting restart')
+                        if (
+                            chunk_interval > expected_interval * 3
+                        ):  # More than 3x step size
+                            logger.warning(
+                                f"[FFmpegAudioSource] Large output interval: {chunk_interval:.3f}s (expected ~{expected_interval:.3f}s) - attempting restart"
+                            )
 
                             # Check system logs for audio-related errors
                             try:
                                 audio_logs = check_audio_system_logs()
                                 if audio_logs:
-                                    logger.warning('[FFmpegAudioSource] Audio-related system log entries found:')
-                                    for log_line in audio_logs.split('\n')[:5]:  # Show first 5 entries
+                                    logger.warning(
+                                        "[FFmpegAudioSource] Audio-related system log entries found:"
+                                    )
+                                    for log_line in audio_logs.split("\n")[
+                                        :5
+                                    ]:  # Show first 5 entries
                                         if log_line.strip():
-                                            logger.warning(f'[FFmpegAudioSource] SYSTEM: {log_line.strip()}')
+                                            logger.warning(
+                                                f"[FFmpegAudioSource] SYSTEM: {log_line.strip()}"
+                                            )
                                 else:
-                                    logger.warning('[FFmpegAudioSource] No audio-related errors found in system logs')
+                                    logger.warning(
+                                        "[FFmpegAudioSource] No audio-related errors found in system logs"
+                                    )
                             except Exception as e:
-                                logger.warning(f'[FFmpegAudioSource] Failed to check system logs: {e}')
+                                logger.warning(
+                                    f"[FFmpegAudioSource] Failed to check system logs: {e}"
+                                )
 
                             # Trigger profiling report for this problematic iteration
                             profile_on_chunk_interval = True
@@ -650,7 +738,6 @@ class FFmpegAudioSource(AudioSource):
                         self._audio_buffer.write(remaining)
                         buffer_size = len(remaining)
 
-
                 # Stop profiling for this iteration
                 profiler.disable()
 
@@ -675,16 +762,18 @@ class FFmpegAudioSource(AudioSource):
                         continue
                     else:
                         # Restart failed, break out of loop
-                        logger.error('[FFmpegAudioSource] Restart failed, stopping reader thread')
+                        logger.error(
+                            "[FFmpegAudioSource] Restart failed, stopping reader thread"
+                        )
                         break
 
             except Exception as e:
-                logger.error(f'[FFmpegAudioSource] Error in reader thread: {e}')
+                logger.error(f"[FFmpegAudioSource] Error in reader thread: {e}")
                 consecutive_errors += 1
 
                 if consecutive_errors >= max_consecutive_errors:
                     logger.error(
-                        f'[FFmpegAudioSource] Too many consecutive errors ({consecutive_errors}), stopping reader'
+                        f"[FFmpegAudioSource] Too many consecutive errors ({consecutive_errors}), stopping reader"
                     )
                     break
 
@@ -694,18 +783,20 @@ class FFmpegAudioSource(AudioSource):
             # Capture profiling stats
             s = io.StringIO()
             stats = pstats.Stats(profiler, stream=s)
-            stats.sort_stats('cumulative')
+            stats.sort_stats("cumulative")
 
             # Get top functions by cumulative time
             stats.print_stats(10)  # Top 10 functions
             profile_output = s.getvalue()
 
-            logger.warning(f'[FFmpegAudioSource] PROBLEMATIC ITERATION PROFILE (loop: {loop_duration:.4f}s):')
-            for line in profile_output.split('\n')[:15]:  # First 15 lines
+            logger.warning(
+                f"[FFmpegAudioSource] PROBLEMATIC ITERATION PROFILE (loop: {loop_duration:.4f}s):"
+            )
+            for line in profile_output.split("\n")[:15]:  # First 15 lines
                 if line.strip():
-                    logger.warning(f'[FFmpegAudioSource] {line}')
+                    logger.warning(f"[FFmpegAudioSource] {line}")
         except Exception as e:
-            logger.error(f'[FFmpegAudioSource] Error generating profile report: {e}')
+            logger.error(f"[FFmpegAudioSource] Error generating profile report: {e}")
 
     def read(self):
         """Read audio chunks from the microphone via FFmpeg."""
@@ -722,10 +813,14 @@ class FFmpegAudioSource(AudioSource):
             )
 
             # Start reader threads
-            self._read_thread = threading.Thread(target=self._read_ffmpeg_output, daemon=True)
+            self._read_thread = threading.Thread(
+                target=self._read_ffmpeg_output, daemon=True
+            )
             self._read_thread.start()
 
-            self._stderr_thread = threading.Thread(target=self._read_ffmpeg_stderr, daemon=True)
+            self._stderr_thread = threading.Thread(
+                target=self._read_ffmpeg_stderr, daemon=True
+            )
             self._stderr_thread.start()
 
             empty_queue_count = 0
@@ -742,11 +837,16 @@ class FFmpegAudioSource(AudioSource):
                     if self._restart_in_progress.is_set():
                         restart_wait_start = time.time()
                         last_log_time = 0
-                        while self._restart_in_progress.is_set() and not self._stop_flag.is_set():
+                        while (
+                            self._restart_in_progress.is_set()
+                            and not self._stop_flag.is_set()
+                        ):
                             current_time = time.time()
                             if current_time - last_log_time >= 5.0:
                                 wait_duration = current_time - restart_wait_start
-                                logger.info(f'[FFmpegAudioSource] Waiting for restart completion ({wait_duration:.1f}s)')
+                                logger.info(
+                                    f"[FFmpegAudioSource] Waiting for restart completion ({wait_duration:.1f}s)"
+                                )
                                 last_log_time = current_time
                             time.sleep(0.01)
                         continue
@@ -754,7 +854,7 @@ class FFmpegAudioSource(AudioSource):
                     # Check if reader thread is still alive
                     if not self._read_thread.is_alive():
                         logger.error(
-                            '[FFmpegAudioSource] Reader thread died unexpectedly'
+                            "[FFmpegAudioSource] Reader thread died unexpectedly"
                         )
                         break
 
@@ -767,11 +867,11 @@ class FFmpegAudioSource(AudioSource):
 
                         if empty_queue_count > max_empty_queue_wait:
                             logger.warning(
-                                '[FFmpegAudioSource] No data for extended period, checking ffmpeg status'
+                                "[FFmpegAudioSource] No data for extended period, checking ffmpeg status"
                             )
                             if self._ffmpeg_process.poll() is not None:
                                 logger.error(
-                                    '[FFmpegAudioSource] FFmpeg process terminated'
+                                    "[FFmpegAudioSource] FFmpeg process terminated"
                                 )
                                 break
                             empty_queue_count = 0  # Reset but continue
@@ -785,28 +885,28 @@ class FFmpegAudioSource(AudioSource):
                         self.stream.on_next(chunk)
                     except Exception as e:
                         logger.error(
-                            f'[FFmpegAudioSource] Failed to send chunk to stream: {e}'
+                            f"[FFmpegAudioSource] Failed to send chunk to stream: {e}"
                         )
                         consecutive_errors += 1
                         if consecutive_errors >= max_consecutive_errors:
                             logger.error(
-                                '[FFmpegAudioSource] Too many consecutive stream errors, stopping'
+                                "[FFmpegAudioSource] Too many consecutive stream errors, stopping"
                             )
                             break
 
                 except KeyboardInterrupt:
-                    logger.info('[FFmpegAudioSource] Keyboard interrupt received')
+                    logger.info("[FFmpegAudioSource] Keyboard interrupt received")
                     break
                 except Exception as e:
                     logger.error(
-                        f'[FFmpegAudioSource] Unexpected error in read loop: {e}',
+                        f"[FFmpegAudioSource] Unexpected error in read loop: {e}",
                         exc_info=True,
                     )
                     self.stream.on_error(e)
                     break
 
         except Exception as e:
-            logger.error(f'[FFmpegAudioSource] Failed to start FFmpeg: {e}')
+            logger.error(f"[FFmpegAudioSource] Failed to start FFmpeg: {e}")
             self.stream.on_error(e)
         finally:
             self.stream.on_completed()
@@ -821,7 +921,7 @@ class FFmpegAudioSource(AudioSource):
             remaining_bytes = self._audio_buffer.tell()
             if remaining_bytes > 0:
                 logger.warning(
-                    f'[FFmpegAudioSource] Discarding {remaining_bytes} bytes of buffered audio'
+                    f"[FFmpegAudioSource] Discarding {remaining_bytes} bytes of buffered audio"
                 )
 
         # Terminate FFmpeg process
@@ -836,21 +936,21 @@ class FFmpegAudioSource(AudioSource):
                     self._ffmpeg_process.kill()
                     self._ffmpeg_process.wait()
             except Exception as e:
-                logger.error(f'[FFmpegAudioSource] Error terminating FFmpeg: {e}')
+                logger.error(f"[FFmpegAudioSource] Error terminating FFmpeg: {e}")
 
         # Wait for reader threads
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=3.0)
             if self._read_thread.is_alive():
                 logger.warning(
-                    '[FFmpegAudioSource] Reader thread did not terminate cleanly'
+                    "[FFmpegAudioSource] Reader thread did not terminate cleanly"
                 )
 
         if self._stderr_thread and self._stderr_thread.is_alive():
             self._stderr_thread.join(timeout=3.0)
             if self._stderr_thread.is_alive():
                 logger.warning(
-                    '[FFmpegAudioSource] Stderr thread did not terminate cleanly'
+                    "[FFmpegAudioSource] Stderr thread did not terminate cleanly"
                 )
 
     def restart(self) -> bool:
