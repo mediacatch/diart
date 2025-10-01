@@ -368,72 +368,62 @@ class FFmpegAudioSource(AudioSource):
     def _build_ffmpeg_command(self):
         """
         Build the FFmpeg command for audio capture that:
-        - mixes the ALSA input with an infinite silent source (so output never stops),
-        - fills short gaps with silence,
-        - logs silence events from the real input via silencedetect.
+        - uses a real-time silent source to guarantee continuous output,
+        - keeps capture aligned with async resampling,
+        - logs silence on the real input,
+        - forces constant-size frames to avoid pipe jitter.
         """
         sr = int(self.sample_rate)
+        block_samples = int(self.block_size)  # e.g., 0.5 s * 16000 = 8000
 
-        # Filter graph:
-        # [1:a] = real capture -> resample/timestamp -> split into [cap] (for mix) and [mon] (for monitoring)
-        # [0:a] = anullsrc (infinite silence at desired SR/mono)
-        # amix  = mix silence + capture so the output keeps flowing even if capture drops
-        # silencedetect on [mon] prints warnings to stderr when the real input is quiet/missing
+        # Graph:
+        # [0:a] = anullsrc (silence, clock driver)
+        # [1:a] = ALSA capture -> resample & timestamp -> split for mixing and monitoring
+        # amix duration=first => timeline driven by [0:a] so output never stalls
+        # asetnsamples => constant-size frames to the pipe
         filter_complex = (
-            "[1:a]"
-            "aresample=async=1:min_comp=0.001:min_hard_comp=0.100:first_pts=0,"
-            "asetpts=N/SR/TB,"
-            "asplit=2[cap][mon];"
-            "[0:a][cap]"
-            "amix=inputs=2:duration=longest:dropout_transition=3[mix];"
-            "[mon]"
-            "silencedetect=noise=-50dB:d=2,anullsink"
-        )
+            # Clock/format the silence source explicitly
+            "[0:a]asetpts=N/SR/TB,aresample=%d:async=1[sil];"
+            # Prepare the real capture
+            "[1:a]aresample=%d:async=1:first_pts=0,asetpts=N/SR/TB,asplit=2[cap][mon];"
+            # Mix with output driven by the silent source
+            "[sil][cap]amix=inputs=2:duration=first:normalize=0:dropout_transition=0[mix];"
+            # Emit fixed-size frames
+            "[mix]asetnsamples=n=%d:p=1[mixed];"
+            # Monitor silence on the real capture
+            "[mon]silencedetect=noise=-50dB:d=2,anullsink"
+        ) % (sr, sr, block_samples)
 
         cmd = [
             "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            # Input 0: infinite silence at target sample rate, mono
-            "-f",
-            "lavfi",
-            "-i",
-            f"anullsrc=r={sr}:cl=mono",
-            # Input 1: your ALSA device (use plughw/default if possible for format conversion)
-            "-f",
-            "alsa",
-            "-thread_queue_size",
-            "8192",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-i",
-            self.device,
+            "-hide_banner", "-loglevel", "warning",
+
+            # Input 0: infinite silence at target SR/mono — our timeline driver
+            "-f", "lavfi", "-i", f"anullsrc=r={sr}:cl=mono",
+
+            # Input 1: your ALSA device (prefer 'plughw:*' or 'default' for conversion)
+            "-f", "alsa",
+            "-thread_queue_size", "8192",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-i", self.device,
+
             # Build the mix + monitor pipeline
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[mix]",  # send the mixed stream (silence+capture) to stdout
-            # Encode/output as raw float32 LE at the requested sample rate, mono
-            "-acodec",
-            "pcm_f32le",
-            "-ar",
-            str(sr),
-            "-ac",
-            "1",
-            "-f",
-            "f32le",
+            "-filter_complex", filter_complex,
+            "-map", "[mixed]",  # send the mixed, fixed-size frames to stdout
+
+            # Encode/output as raw float32 LE at requested SR/mono
+            "-acodec", "pcm_f32le",
+            "-ar", str(sr),
+            "-ac", "1",
+            "-f", "f32le",
+
             # Low-latency / robustness flags
-            "-fflags",
-            "nobuffer+flush_packets+discardcorrupt",
-            "-flags",
-            "low_delay",
-            "-avioflags",
-            "direct",
-            "-flush_packets",
-            "1",
+            "-fflags", "nobuffer+flush_packets+discardcorrupt",
+            "-flags", "low_delay",
+            "-avioflags", "direct",
+            "-flush_packets", "1",
+
             "-",  # stdout
         ]
         return cmd
@@ -548,7 +538,6 @@ class FFmpegAudioSource(AudioSource):
         last_chunk_time = time.time()
         timeout_seconds = 5.0
         read_timeout = 1.0
-        read_chunk_size = 8192  # Read in smaller chunks from ffmpeg to reduce buffering
 
         # Profiling setup
         profiler = cProfile.Profile()
@@ -603,7 +592,7 @@ class FFmpegAudioSource(AudioSource):
 
                     if readable:
                         # Data is available, read it (this should not block)
-                        audio_bytes = self._ffmpeg_process.stdout.read(read_chunk_size)
+                        audio_bytes = self._ffmpeg_process.stdout.read(self.block_size_bytes)
                         read_duration = time.time() - read_start
 
                         if read_duration > 0.1:
