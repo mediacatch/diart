@@ -34,6 +34,7 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         max_speakers: int = 20,
         normalize_embedding_weights: bool = False,
         device: torch.device | None = None,
+        torch_compile: bool = False,
         sample_rate: int = 16000,
         **kwargs,
     ):
@@ -68,6 +69,7 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self.torch_compile = torch_compile
 
     @property
     def duration(self) -> float:
@@ -94,7 +96,7 @@ class SpeakerDiarization(base.Pipeline):
         assert self._config.step <= self._config.latency <= self._config.duration, msg
 
         self.segmentation = SpeakerSegmentation(
-            self._config.segmentation, self._config.device
+            self._config.segmentation, self._config.device, self._config.torch_compile
         )
         self.embedding = OverlapAwareSpeakerEmbedding(
             self._config.embedding,
@@ -103,6 +105,7 @@ class SpeakerDiarization(base.Pipeline):
             norm=1,
             normalize_weights=self._config.normalize_embedding_weights,
             device=self._config.device,
+            torch_compile=self._config.torch_compile,
         )
         self.pred_aggregation = DelayedAggregation(
             self._config.step,

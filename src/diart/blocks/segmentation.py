@@ -8,7 +8,12 @@ from ..models import SegmentationModel
 
 
 class SpeakerSegmentation:
-    def __init__(self, model: SegmentationModel, device: Optional[torch.device] = None):
+    def __init__(
+        self,
+        model: SegmentationModel,
+        device: Optional[torch.device] = None,
+        torch_compile: bool = False,
+    ):
         self.model = model
         self.model.eval()
         self.device = device
@@ -16,15 +21,19 @@ class SpeakerSegmentation:
             self.device = torch.device("cpu")
         self.model.to(self.device)
         self.formatter = TemporalFeatureFormatter()
+        self.torch_compile = torch_compile
+        if self.torch_compile:
+            self.model = torch.compile(self.model)
 
     @staticmethod
     def from_pretrained(
         model,
         use_hf_token: Union[Text, bool, None] = True,
         device: Optional[torch.device] = None,
+        torch_compile: bool = False,
     ) -> "SpeakerSegmentation":
         seg_model = SegmentationModel.from_pretrained(model, use_hf_token)
-        return SpeakerSegmentation(seg_model, device)
+        return SpeakerSegmentation(seg_model, device, torch_compile)
 
     def __call__(self, waveform: TemporalFeatures) -> TemporalFeatures:
         """

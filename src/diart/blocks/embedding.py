@@ -9,7 +9,12 @@ from ..models import EmbeddingModel
 
 
 class SpeakerEmbedding:
-    def __init__(self, model: EmbeddingModel, device: Optional[torch.device] = None):
+    def __init__(
+        self,
+        model: EmbeddingModel,
+        device: Optional[torch.device] = None,
+        torch_compile: bool = False,
+    ):
         self.model = model
         self.model.eval()
         self.device = device
@@ -18,15 +23,19 @@ class SpeakerEmbedding:
         self.model.to(self.device)
         self.waveform_formatter = TemporalFeatureFormatter()
         self.weights_formatter = TemporalFeatureFormatter()
+        self.torch_compile = torch_compile
+        if self.torch_compile:
+            self.model = torch.compile(self.model)
 
     @staticmethod
     def from_pretrained(
         model,
         use_hf_token: Union[Text, bool, None] = True,
         device: Optional[torch.device] = None,
+        torch_compile: bool = False,
     ) -> "SpeakerEmbedding":
         emb_model = EmbeddingModel.from_pretrained(model, use_hf_token)
-        return SpeakerEmbedding(emb_model, device)
+        return SpeakerEmbedding(emb_model, device, torch_compile)
 
     def __call__(
         self, waveform: TemporalFeatures, weights: Optional[TemporalFeatures] = None
@@ -152,8 +161,9 @@ class OverlapAwareSpeakerEmbedding:
         norm: Union[float, torch.Tensor] = 1,
         normalize_weights: bool = False,
         device: Optional[torch.device] = None,
+        torch_compile: bool = False,
     ):
-        self.embedding = SpeakerEmbedding(model, device)
+        self.embedding = SpeakerEmbedding(model, device, torch_compile)
         self.osp = OverlappedSpeechPenalty(gamma, beta, normalize_weights)
         self.normalize = EmbeddingNormalization(norm)
 
@@ -166,10 +176,11 @@ class OverlapAwareSpeakerEmbedding:
         use_hf_token: Union[Text, bool, None] = True,
         normalize_weights: bool = False,
         device: Optional[torch.device] = None,
+        torch_compile: bool = False,
     ):
         model = EmbeddingModel.from_pretrained(model, use_hf_token)
         return OverlapAwareSpeakerEmbedding(
-            model, gamma, beta, norm, normalize_weights, device
+            model, gamma, beta, norm, normalize_weights, device, torch_compile
         )
 
     def __call__(
