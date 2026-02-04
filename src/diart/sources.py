@@ -6,9 +6,9 @@ from typing import Text, Optional, AnyStr, Dict, Any, Union, Tuple
 import numpy as np
 import sounddevice as sd
 import torch
+import torchaudio
 from einops import rearrange
 from rx.subject import Subject
-from torchaudio.io import StreamReader
 from websocket_server import WebsocketServer
 
 from . import utils
@@ -132,6 +132,123 @@ class FileAudioSource(AudioSource):
         self.close()
 
     def close(self):
+        self.is_closed = True
+
+
+class TensorAudioSource(AudioSource):
+    """Represents an audio source from a tensor or numpy array.
+
+    Parameters
+    ----------
+    audio_dict: dict
+        Dictionary containing:
+        - 'array': Audio data as numpy array or torch tensor
+        - 'sampling_rate': Sample rate of the input audio
+    sample_rate: int
+        Target sample rate of the chunks emitted.
+    padding: (float, float)
+        Left and right padding to add to the audio (in seconds).
+        Defaults to (0, 0).
+    block_duration: float
+        Duration of each emitted chunk in seconds.
+        Defaults to 0.5 seconds.
+    """
+
+    def __init__(
+        self,
+        audio_dict: dict,
+        sample_rate: int,
+        padding: Tuple[float, float] = (0, 0),
+        block_duration: float = 0.5,
+    ):
+        super().__init__("tensor_audio", sample_rate)
+
+        # Extract audio array and input sample rate
+        audio_array = audio_dict['array']
+        input_sample_rate = audio_dict['sampling_rate']
+
+        # Convert to torch tensor if numpy array
+        if isinstance(audio_array, np.ndarray):
+            waveform = torch.from_numpy(audio_array).float()
+        else:
+            waveform = audio_array.float()
+
+        # Ensure waveform is 2D (channel, samples)
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # Resample if needed
+        if input_sample_rate != sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=input_sample_rate,
+                new_freq=sample_rate
+            )
+            waveform = resampler(waveform)
+
+        # Ensure mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        self.waveform = waveform
+        self._duration = waveform.shape[-1] / sample_rate
+        self.resolution = 1 / sample_rate
+        self.block_size = int(np.rint(block_duration * sample_rate))
+        self.padding_start, self.padding_end = padding
+        self.is_closed = False
+
+    @property
+    def duration(self) -> Optional[float]:
+        """Return the total duration including padding"""
+        return self.padding_start + self._duration + self.padding_end
+
+    def read(self):
+        """Send each chunk of samples through the stream"""
+        waveform = self.waveform
+
+        # Add zero padding at the beginning if required
+        if self.padding_start > 0:
+            num_pad_samples = int(np.rint(self.padding_start * self.sample_rate))
+            zero_padding = torch.zeros(waveform.shape[0], num_pad_samples)
+            waveform = torch.cat([zero_padding, waveform], dim=1)
+
+        # Add zero padding at the end if required
+        if self.padding_end > 0:
+            num_pad_samples = int(np.rint(self.padding_end * self.sample_rate))
+            zero_padding = torch.zeros(waveform.shape[0], num_pad_samples)
+            waveform = torch.cat([waveform, zero_padding], dim=1)
+
+        # Split into blocks
+        _, num_samples = waveform.shape
+        chunks = rearrange(
+            waveform.unfold(1, self.block_size, self.block_size),
+            "channel chunk sample -> chunk channel sample",
+        ).numpy()
+
+        # Add last incomplete chunk with padding
+        if num_samples % self.block_size != 0:
+            last_chunk = (
+                waveform[:, chunks.shape[0] * self.block_size :].unsqueeze(0).numpy()
+            )
+            diff_samples = self.block_size - last_chunk.shape[-1]
+            last_chunk = np.concatenate(
+                [last_chunk, np.zeros((1, 1, diff_samples))], axis=-1
+            )
+            chunks = np.vstack([chunks, last_chunk])
+
+        # Stream blocks
+        for i, waveform in enumerate(chunks):
+            try:
+                if self.is_closed:
+                    break
+                self.stream.on_next(waveform)
+            except BaseException as e:
+                self.stream.on_error(e)
+                break
+        self.stream.on_completed()
+        self.close()
+
+    def close(self):
+        """Close the audio source"""
         self.is_closed = True
 
 
@@ -271,52 +388,3 @@ class WebSocketAudioSource(AudioSource):
             self.server.send_message(self.client, message)
 
 
-class TorchStreamAudioSource(AudioSource):
-    def __init__(
-        self,
-        uri: Text,
-        sample_rate: int,
-        streamer: StreamReader,
-        stream_index: Optional[int] = None,
-        block_duration: float = 0.5,
-    ):
-        super().__init__(uri, sample_rate)
-        self.block_size = int(np.rint(block_duration * self.sample_rate))
-        self._streamer = streamer
-        self._streamer.add_basic_audio_stream(
-            frames_per_chunk=self.block_size,
-            stream_index=stream_index,
-            format="fltp",
-            sample_rate=self.sample_rate,
-        )
-        self.is_closed = False
-
-    def read(self):
-        for item in self._streamer.stream():
-            try:
-                if self.is_closed:
-                    break
-                # shape (samples, channels) to (1, samples)
-                chunk = np.mean(item[0].numpy(), axis=1, keepdims=True).T
-                self.stream.on_next(chunk)
-            except BaseException as e:
-                self.stream.on_error(e)
-                break
-        self.stream.on_completed()
-        self.close()
-
-    def close(self):
-        self.is_closed = True
-
-
-class AppleDeviceAudioSource(TorchStreamAudioSource):
-    def __init__(
-        self,
-        sample_rate: int,
-        device: str = "0:0",
-        stream_index: int = 0,
-        block_duration: float = 0.5,
-    ):
-        uri = f"apple_input_device:{device}"
-        streamer = StreamReader(device, format="avfoundation")
-        super().__init__(uri, sample_rate, streamer, stream_index, block_duration)
