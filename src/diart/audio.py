@@ -2,8 +2,7 @@ from pathlib import Path
 from typing import Text, Union
 
 import torch
-import torchaudio
-from torchaudio.functional import resample
+from torchcodec.decoders import AudioDecoder
 
 
 FilePath = Union[Text, Path]
@@ -26,13 +25,11 @@ class AudioLoader:
         -------
         waveform : torch.Tensor, shape (channels, samples)
         """
-        waveform, sample_rate = torchaudio.load(filepath)
-        # Get channel mean if mono
-        if self.mono and waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        # Resample if needed
-        if self.sample_rate != sample_rate:
-            waveform = resample(waveform, sample_rate, self.sample_rate)
+        num_channels = 1 if self.mono else None
+        decoder = AudioDecoder(
+            filepath, sample_rate=self.sample_rate, num_channels=num_channels
+        )
+        waveform = decoder.get_all_samples().data
         return waveform
 
     @staticmethod
@@ -49,5 +46,8 @@ class AudioLoader:
         duration : float
             Duration in seconds.
         """
-        info = torchaudio.info(filepath)
-        return info.num_frames / info.sample_rate
+        decoder = AudioDecoder(filepath)
+        duration = decoder.metadata.duration_seconds
+        if duration is None:
+            raise ValueError(f"Could not determine duration for {filepath}")
+        return duration
